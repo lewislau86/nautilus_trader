@@ -38,9 +38,11 @@ from nautilus_trader.adapters.binance import BinanceInstrumentProviderConfig
 from nautilus_trader.adapters.binance import BinanceProductType
 from nautilus_trader.adapters.binance import BinanceSpotMarketDataMode
 from nautilus_trader.adapters.binance import decode_binance_futures_client_order_id
+from nautilus_trader.adapters.binance import decode_binance_klines
 from nautilus_trader.adapters.binance import decode_binance_spot_client_order_id
 from nautilus_trader.adapters.binance import load_binance_instruments
 from nautilus_trader.adapters.binance import load_binance_order_book_deltas
+from nautilus_trader.adapters.binance import parse_binance_instrument
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import Venue
 
@@ -96,9 +98,160 @@ def test_binance_migration_exports_runtime_names() -> None:
     assert BINANCE == "BINANCE"
     assert ClientId.from_str("BINANCE") == BINANCE_CLIENT_ID
     assert Venue.from_str("BINANCE") == BINANCE_VENUE
+    assert callable(decode_binance_klines)
     assert callable(load_binance_instruments)
+    assert callable(parse_binance_instrument)
     assert load_binance_order_book_deltas.__module__ == "nautilus_trader.adapters.binance"
     assert not hasattr(binance, "BinanceOrderBookDeltaDataLoader")
+
+
+def test_decode_binance_klines_uses_native_schema_without_transport() -> None:
+    """
+    Test decode binance klines uses native schema without transport.
+    """
+    payload = (
+        WORKSPACE_ROOT / "crates/adapters/binance/test_data/spot/http_json/klines_response.json"
+    ).read_bytes()
+
+    rows = decode_binance_klines(payload)
+
+    assert rows == [
+        (
+            1499040000000,
+            "0.01634790",
+            "0.80000000",
+            "0.01575800",
+            "0.01577100",
+            "148976.11427815",
+            1499644799999,
+            308,
+        ),
+    ]
+
+
+def test_decode_binance_klines_rejects_invalid_native_row() -> None:
+    """
+    Test decode binance klines rejects invalid native row.
+    """
+    with pytest.raises(ValueError, match="Invalid kline array length"):
+        decode_binance_klines(b'[[1, "1.0"]]')
+
+
+def test_parse_binance_instrument_uses_native_usdm_parser_without_transport() -> None:
+    """
+    Test parse binance instrument uses native usdm parser without transport.
+    """
+    payload = (
+        WORKSPACE_ROOT
+        / "crates/adapters/binance/test_data/futures/http_json/exchange_info_usdm.json"
+    ).read_bytes()
+    timestamp = 1_735_689_600_123_000_000
+
+    instrument = parse_binance_instrument(
+        payload,
+        BinanceProductType.USD_M,
+        "BTCUSDT",
+        timestamp,
+    )
+
+    assert str(instrument.id) == "BTCUSDT-PERP.BINANCE"
+    assert str(instrument.raw_symbol) == "BTCUSDT"
+    assert instrument.price_precision == 2
+    assert instrument.size_precision == 3
+    assert instrument.ts_event == timestamp
+    assert instrument.ts_init == timestamp
+
+
+def test_parse_binance_instrument_uses_native_coinm_parser_without_transport() -> None:
+    """
+    Test parse binance instrument uses native coinm parser without transport.
+    """
+    payload = json.loads(
+        (
+            WORKSPACE_ROOT
+            / "crates/adapters/binance/test_data/futures/http_json/exchange_info_delivery_coinm.json"
+        ).read_text(encoding="utf-8"),
+    )
+    payload["symbols"][0].update(
+        symbol="BTCUSD_PERP",
+        contractType="PERPETUAL",
+        deliveryDate=4_133_404_800_000,
+    )
+    timestamp = 1_735_689_600_456_000_000
+
+    instrument = parse_binance_instrument(
+        json.dumps(payload).encode(),
+        BinanceProductType.COIN_M,
+        "BTCUSD_PERP",
+        timestamp,
+    )
+
+    assert str(instrument.id) == "BTCUSD_PERP.BINANCE"
+    assert instrument.is_inverse is True
+    assert instrument.multiplier.as_double() == 100.0
+    assert instrument.ts_event == timestamp
+    assert instrument.ts_init == timestamp
+
+
+def test_parse_binance_instrument_uses_native_spot_parser_without_transport() -> None:
+    """
+    Test parse binance instrument uses native spot parser without transport.
+    """
+    payload = json.loads(
+        (
+            WORKSPACE_ROOT
+            / "crates/adapters/binance/test_data/spot/http_json/exchange_info_response.json"
+        ).read_text(encoding="utf-8"),
+    )
+    payload["symbols"][0]["filters"] = [
+        {
+            "filterType": "PRICE_FILTER",
+            "minPrice": "0.00000100",
+            "maxPrice": "100000.00000000",
+            "tickSize": "0.00000100",
+        },
+        {
+            "filterType": "LOT_SIZE",
+            "minQty": "0.00100000",
+            "maxQty": "100000.00000000",
+            "stepSize": "0.00100000",
+        },
+    ]
+    timestamp = 1_735_689_600_789_000_000
+
+    instrument = parse_binance_instrument(
+        json.dumps(payload).encode(),
+        BinanceProductType.SPOT,
+        "ETHBTC",
+        timestamp,
+    )
+
+    assert str(instrument.id) == "ETHBTC.BINANCE"
+    assert instrument.price_precision == 6
+    assert instrument.size_precision == 3
+    assert instrument.ts_event == timestamp
+    assert instrument.ts_init == timestamp
+
+
+def test_parse_binance_instrument_rejects_missing_symbol() -> None:
+    """
+    Test parse binance instrument rejects missing symbol.
+    """
+    payload = (
+        WORKSPACE_ROOT
+        / "crates/adapters/binance/test_data/futures/http_json/exchange_info_usdm.json"
+    ).read_bytes()
+
+    with pytest.raises(ValueError, match="does not contain symbol 'NOTREAL'"):
+        parse_binance_instrument(payload, BinanceProductType.USD_M, "NOTREAL", 1)
+
+
+def test_parse_binance_instrument_rejects_unsupported_product() -> None:
+    """
+    Test parse binance instrument rejects unsupported product.
+    """
+    with pytest.raises(ValueError, match="supports Spot, UsdM, or CoinM, was Margin"):
+        parse_binance_instrument(b"{}", BinanceProductType.MARGIN, "BTCUSDT", 1)
 
 
 def test_binance_client_order_id_decoders_handle_encoded_and_external_ids() -> None:

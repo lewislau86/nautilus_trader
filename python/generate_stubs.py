@@ -252,8 +252,16 @@ EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "nautilus_trader/adapters/binance/__init__.pyi": (
         (
+            "from nautilus_trader.adapters.binance.instruments import decode_binance_klines as "
+            "decode_binance_klines"
+        ),
+        (
             "from nautilus_trader.adapters.binance.instruments import load_binance_instruments as "
             "load_binance_instruments"
+        ),
+        (
+            "from nautilus_trader.adapters.binance.instruments import parse_binance_instrument as "
+            "parse_binance_instrument"
         ),
     ),
     "nautilus_trader/core/__init__.pyi": (

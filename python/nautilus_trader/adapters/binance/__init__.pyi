@@ -12,7 +12,13 @@ import pandas as pd
 from nautilus_trader import model
 from nautilus_trader import network
 from nautilus_trader.adapters.binance.instruments import (
+    decode_binance_klines as decode_binance_klines,
+)
+from nautilus_trader.adapters.binance.instruments import (
     load_binance_instruments as load_binance_instruments,
+)
+from nautilus_trader.adapters.binance.instruments import (
+    parse_binance_instrument as parse_binance_instrument,
 )
 
 __all__ = [
@@ -38,10 +44,12 @@ __all__ = [
     "BinanceSpotMarketDataMode",
     "BinanceSpotTicker",
     "decode_binance_futures_client_order_id",
+    "decode_binance_klines",
     "decode_binance_spot_client_order_id",
     "get_binance_arrow_schema_map",
     "load_binance_instruments",
     "load_binance_order_book_deltas",
+    "parse_binance_instrument",
 ]
 
 BINANCE: str

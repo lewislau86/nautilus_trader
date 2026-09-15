@@ -181,6 +181,11 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         instruments::py_load_binance_instruments,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(instruments::py_decode_binance_klines, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        instruments::py_parse_binance_instrument,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         data::py_load_binance_order_book_deltas,
         m

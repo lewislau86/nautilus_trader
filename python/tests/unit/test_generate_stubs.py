@@ -1673,9 +1673,11 @@ def test_binance_stub_exposes_python_migration_surface() -> None:
         "BINANCE_CLIENT_ID",
         "BINANCE_VENUE",
         "decode_binance_futures_client_order_id",
+        "decode_binance_klines",
         "decode_binance_spot_client_order_id",
         "load_binance_instruments",
         "load_binance_order_book_deltas",
+        "parse_binance_instrument",
     }
     functions = {node.name: node for node in stub_module.body if isinstance(node, ast.FunctionDef)}
     reexports = {
@@ -1698,8 +1700,18 @@ def test_binance_stub_exposes_python_migration_surface() -> None:
     assert "BINANCE_VENUE: model.Venue" in stub
     assert (
         "nautilus_trader.adapters.binance.instruments",
+        "decode_binance_klines",
+        "decode_binance_klines",
+    ) in reexports
+    assert (
+        "nautilus_trader.adapters.binance.instruments",
         "load_binance_instruments",
         "load_binance_instruments",
+    ) in reexports
+    assert (
+        "nautilus_trader.adapters.binance.instruments",
+        "parse_binance_instrument",
+        "parse_binance_instrument",
     ) in reexports
     load = functions["load_binance_order_book_deltas"]
     assert load.decorator_list == []
