@@ -1560,9 +1560,11 @@ impl BinanceFuturesAlgoOrder {
         report.avg_px = avg_px;
 
         if let Some(trigger_price) = trigger_price {
-            report = report
-                .with_trigger_price(trigger_price)
-                .with_trigger_type(parse_working_type(self.working_type));
+            report = report.with_trigger_price(trigger_price);
+        }
+
+        if uses_algo_working_type(self.order_type) {
+            report = report.with_trigger_type(parse_working_type(self.working_type));
         }
 
         if let Some(trailing_offset) = trailing_offset {
@@ -1571,9 +1573,11 @@ impl BinanceFuturesAlgoOrder {
                 .with_trailing_offset_type(TrailingOffsetType::BasisPoints);
         }
 
-        if let Some(activation_price) = self
-            .activate_price
-            .as_deref()
+        let raw_activation_price = (self.order_type == BinanceFuturesOrderType::TrailingStopMarket)
+            .then_some(self.activate_price.as_deref())
+            .flatten()
+            .filter(|price| !price.trim().is_empty());
+        if let Some(activation_price) = raw_activation_price
             .map(|price| {
                 parse_positive_price_at_precision(price, price_precision, "activate_price")
             })
@@ -1704,13 +1708,9 @@ impl BinanceFuturesAlgoOrder {
     }
 
     fn parse_trigger_price(&self, price_precision: u8) -> anyhow::Result<Option<Price>> {
-        let raw_trigger_price = match self.order_type {
-            BinanceFuturesOrderType::TrailingStopMarket => self
-                .trigger_price
-                .as_deref()
-                .or(self.activate_price.as_deref()),
-            _ => self.trigger_price.as_deref(),
-        };
+        let raw_trigger_price = (self.order_type != BinanceFuturesOrderType::TrailingStopMarket)
+            .then_some(self.trigger_price.as_deref())
+            .flatten();
         let trigger_price = raw_trigger_price
             .map(|price| parse_positive_price_at_precision(price, price_precision, "trigger_price"))
             .transpose()?
@@ -1829,8 +1829,12 @@ fn requires_algo_trigger_price(order_type: BinanceFuturesOrderType) -> bool {
             | BinanceFuturesOrderType::StopMarket
             | BinanceFuturesOrderType::TakeProfit
             | BinanceFuturesOrderType::TakeProfitMarket
-            | BinanceFuturesOrderType::TrailingStopMarket
     )
+}
+
+fn uses_algo_working_type(order_type: BinanceFuturesOrderType) -> bool {
+    requires_algo_trigger_price(order_type)
+        || order_type == BinanceFuturesOrderType::TrailingStopMarket
 }
 
 /// Cancel response for algo orders from Binance Futures Algo Service API.
@@ -2759,13 +2763,34 @@ mod tests {
             .to_order_status_report(account_id, instrument_id, 2, 3, ts_init)
             .unwrap();
 
-        assert_eq!(report.trigger_price, Some(Price::from("45000.00")));
+        assert_eq!(report.trigger_price, None);
         assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
+        assert_eq!(report.activation_price, Some(Price::from("45000.00")));
         assert_eq!(report.trailing_offset, Some(Decimal::from(25)));
         assert_eq!(
             report.trailing_offset_type,
             Some(TrailingOffsetType::BasisPoints),
         );
+    }
+
+    #[rstest]
+    fn test_non_trailing_algo_report_ignores_empty_trailing_only_fields() {
+        let mut order = algo_order_with_price(None);
+        order.activate_price = Some(String::new());
+        order.callback_rate = Some(String::new());
+        let report = order
+            .to_order_status_report(
+                AccountId::from("BINANCE-FUTURES-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                2,
+                3,
+                UnixNanos::from(1_000_000_000u64),
+            )
+            .unwrap();
+
+        assert_eq!(report.activation_price, None);
+        assert_eq!(report.trailing_offset, None);
+        assert_eq!(report.trailing_offset_type, None);
     }
 
     #[rstest]

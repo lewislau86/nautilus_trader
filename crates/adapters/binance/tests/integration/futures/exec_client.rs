@@ -1209,29 +1209,42 @@ fn create_exec_test_router_with_algo_capture_and_hedge_mode(
                     return unauthorized_response();
                 }
 
-                *captured_query.lock() = Some(query);
-
-                json_response(&json!({
+                let value = |name: &str, default: &str| {
+                    query
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| default.to_string())
+                };
+                let client_algo_id = query
+                    .get("clientAlgoId")
+                    .cloned()
+                    .expect("Algo submit query should include clientAlgoId");
+                let close_position = value("closePosition", "false") == "true";
+                let reduce_only = value("reduceOnly", "false") == "true";
+                let response = json!({
                     "algoId": 12345,
-                    "clientAlgoId": "test-algo-order-001",
+                    "clientAlgoId": client_algo_id,
                     "algoType": "CONDITIONAL",
-                    "orderType": "TRAILING_STOP_MARKET",
-                    "symbol": "BTCUSDT",
-                    "side": "SELL",
-                    "positionSide": "BOTH",
-                    "timeInForce": "GTC",
-                    "quantity": "0.001",
+                    "orderType": value("type", "STOP_MARKET"),
+                    "symbol": value("symbol", "BTCUSDT"),
+                    "side": value("side", "SELL"),
+                    "positionSide": value("positionSide", "BOTH"),
+                    "timeInForce": value("timeInForce", "GTC"),
+                    "quantity": value("quantity", "0"),
                     "algoStatus": "NEW",
-                    "triggerPrice": "10000.00",
-                    "price": "0",
-                    "workingType": "MARK_PRICE",
-                    "activatePrice": "10000.00",
-                    "callbackRate": "0.25",
-                    "reduceOnly": true,
-                    "closePosition": false,
+                    "triggerPrice": value("triggerPrice", "0"),
+                    "price": value("price", "0"),
+                    "workingType": value("workingType", "CONTRACT_PRICE"),
+                    "activatePrice": value("activatePrice", ""),
+                    "callbackRate": value("callbackRate", ""),
+                    "reduceOnly": reduce_only,
+                    "closePosition": close_position,
                     "priceProtect": false,
                     "selfTradePreventionMode": "NONE"
-                }))
+                });
+                *captured_query.lock() = Some(query);
+
+                json_response(&response)
             }
         }),
     )
@@ -2449,7 +2462,7 @@ async fn test_submit_trailing_stop_order_uses_activate_price_and_precise_callbac
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
 
-    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
 
     client.start().unwrap();
@@ -2532,6 +2545,51 @@ async fn test_submit_trailing_stop_order_uses_activate_price_and_precise_callbac
     assert_eq!(query.get("reduceOnly"), Some(&"true".to_string()));
     assert!(!query.contains_key("triggerPrice"));
     assert!(!query.contains_key("activationPrice"));
+
+    let accepted = recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Accepted(accepted))
+                if accepted.client_order_id == client_order_id
+        )
+    })
+    .await;
+    let ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) = accepted else {
+        unreachable!()
+    };
+    assert_eq!(accepted.venue_order_id, VenueOrderId::from("12345"));
+    assert!(!accepted.reconciliation);
+    assert!(accepted.causation_id.is_some());
+
+    let report = recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Report(ExecutionReport::Order(report))
+                if report.client_order_id == Some(client_order_id)
+        )
+    })
+    .await;
+    let ExecutionEvent::Report(ExecutionReport::Order(report)) = report else {
+        unreachable!()
+    };
+    assert_eq!(accepted.causation_id, Some(report.report_id));
+    assert_eq!(report.venue_order_id, VenueOrderId::from("12345"));
+    assert_eq!(report.activation_price, Some(Price::from("10000.00")));
+    assert_eq!(report.trigger_price, None);
+    assert_eq!(report.trigger_type, Some(TriggerType::MarkPrice));
+    assert_eq!(
+        report.trailing_offset,
+        Some(rust_decimal::Decimal::from(25)),
+    );
+    assert_eq!(
+        report.trailing_offset_type,
+        Some(TrailingOffsetType::BasisPoints),
+    );
+    assert!(
+        client.execution_safety_error().is_none(),
+        "unexpected Algo submit safety failure: {:?}",
+        client.execution_safety_error(),
+    );
 }
 
 #[rstest]
@@ -2682,7 +2740,7 @@ async fn test_submit_close_position_translates_reduce_only_intent(#[case] hedge_
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
 
-    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
     add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
 
     client.start().unwrap();
@@ -2712,6 +2770,24 @@ async fn test_submit_close_position_translates_reduce_only_intent(#[case] hedge_
     assert_eq!(query.get("closePosition").map(String::as_str), Some("true"));
     assert!(!query.contains_key("reduceOnly"));
     assert!(!query.contains_key("quantity"));
+
+    let report = recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Report(ExecutionReport::Order(report))
+                if report.client_order_id == Some(client_order_id)
+        )
+    })
+    .await;
+    let ExecutionEvent::Report(ExecutionReport::Order(report)) = report else {
+        unreachable!()
+    };
+    assert_eq!(report.quantity, Quantity::from("0.001"));
+    assert!(
+        client.execution_safety_error().is_none(),
+        "unexpected close-position submit safety failure: {:?}",
+        client.execution_safety_error(),
+    );
 }
 
 #[rstest]

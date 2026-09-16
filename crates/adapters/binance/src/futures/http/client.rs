@@ -2416,6 +2416,17 @@ impl BinanceFuturesHttpClient {
         };
 
         let order = self.inner.submit_algo_order(&params).await?;
+        anyhow::ensure!(
+            order.algo_id > 0
+                && order.algo_type == BinanceAlgoType::Conditional
+                && order.symbol == format_binance_symbol(&instrument_id),
+            "Binance Futures Algo submit response returned a different venue identity"
+        );
+        anyhow::ensure!(
+            order.close_position.unwrap_or(false) == params.close_position.unwrap_or(false)
+                && order.reduce_only.unwrap_or(false) == params.reduce_only.unwrap_or(false),
+            "Binance Futures Algo submit response returned different close-only semantics"
+        );
         let ts_init = self.clock.get_time_ns();
         order.to_order_status_report(
             account_id,

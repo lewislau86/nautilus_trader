@@ -385,10 +385,9 @@ pub(crate) fn dispatch_order_update(
                     return;
                 }
 
-                if dispatch_state.has_emitted_accepted(&client_order_id) {
+                if !dispatch_state.mark_accepted_once(client_order_id) {
                     log::debug!("Skipping duplicate Accepted for {client_order_id}");
                 } else {
-                    dispatch_state.insert_accepted(client_order_id);
                     let accepted = OrderAccepted::new(
                         emitter.trader_id(),
                         identity.strategy_id,
@@ -1394,10 +1393,16 @@ pub(crate) fn dispatch_algo_update(
             let venue_order_id = VenueOrderId::new(algo_data.algo_id.to_string());
             dispatch_state.insert_algo_order_id(client_order_id, venue_order_id);
 
-            if let Some(identity) = identity
-                && !dispatch_state.has_emitted_accepted(&client_order_id)
-            {
-                dispatch_state.insert_accepted(client_order_id);
+            if let Some(identity) = identity {
+                if dispatch_state.defer_algo_acceptance(client_order_id, venue_order_id) {
+                    log::debug!(
+                        "Deferring Algo Accepted until HTTP submit response for {client_order_id}"
+                    );
+                    return;
+                }
+                if !dispatch_state.mark_accepted_once(client_order_id) {
+                    return;
+                }
                 let accepted = OrderAccepted::new(
                     emitter.trader_id(),
                     identity.strategy_id,
@@ -2009,6 +2014,44 @@ mod tests {
         assert!(collect_events(&mut rx).is_empty());
         assert!(triggered_algo_ids.is_empty());
         assert!(dispatch_state.order_identities.is_empty());
+    }
+
+    #[rstest]
+    fn test_dispatch_algo_new_defers_acceptance_while_http_submit_is_pending() {
+        let ts_init = UnixNanos::from(42);
+        let clock = Box::leak(Box::new(AtomicTime::new(false, ts_init)));
+        let mut msg: BinanceFuturesAlgoUpdateMsg = load_user_data_fixture("algo_update_new.json");
+        let client_order_id = ClientOrderId::from("TEST");
+        msg.algo_order.client_algo_id = client_order_id.to_string();
+        let venue_order_id = VenueOrderId::new(msg.algo_order.algo_id.to_string());
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = create_tracked_state_with_price_and_qty(
+            client_order_id,
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            None,
+            Quantity::from("0.001"),
+        );
+        dispatch_state.begin_algo_submission(client_order_id);
+
+        dispatch_algo_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            &Arc::new(AtomicSet::new()),
+            false,
+        );
+
+        assert!(collect_events(&mut rx).is_empty());
+        assert!(!dispatch_state.has_emitted_accepted(&client_order_id));
+        assert_eq!(
+            dispatch_state.finish_algo_submission(client_order_id),
+            Some(venue_order_id),
+        );
     }
 
     #[rstest]

@@ -55,11 +55,12 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, OmsType, OrderType, PositionSide, TimeInForce, TrailingOffsetType, TriggerType,
+        AccountType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce,
+        TrailingOffsetType, TriggerType,
     },
     events::{
-        AccountState, OrderCancelRejected, OrderCanceled, OrderDeniedReason, OrderEventAny,
-        OrderModifyRejected, OrderRejected, OrderUpdated,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDeniedReason,
+        OrderEventAny, OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, Venue, VenueOrderId,
@@ -111,7 +112,10 @@ use crate::{
             BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS,
         },
         credential::resolve_credentials,
-        dispatch::{OrderIdentity, PendingOperation, PendingRequest, WsDispatchState},
+        dispatch::{
+            OrderIdentity, PendingOperation, PendingRequest, WsDispatchState,
+            ensure_accepted_emitted,
+        },
         encoder::encode_broker_id,
         enums::{
             BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide, BinancePriceMatch,
@@ -836,6 +840,9 @@ impl BinanceFuturesExecutionClient {
         let http_client = self.http_client.clone();
         let dispatch_state = self.dispatch_state.clone();
 
+        if use_algo_api {
+            dispatch_state.begin_algo_submission(client_order_id);
+        }
         self.emitter.emit_order_submitted(&order);
 
         self.spawn_task("submit_order", async move {
@@ -889,7 +896,99 @@ impl BinanceFuturesExecutionClient {
             };
 
             match result {
-                Ok(report) => {
+                Ok(mut report) => {
+                    if use_algo_api {
+                        if let Err(e) = validate_algo_submit_response(
+                            &report,
+                            account_id,
+                            instrument_id,
+                            client_order_id,
+                            order_side,
+                            order_type,
+                            quantity,
+                            time_in_force,
+                            price,
+                            trigger_price,
+                            close_position,
+                            activation_price,
+                            trailing_offset,
+                            trigger_type,
+                        ) {
+                            let deferred =
+                                dispatch_state.finish_algo_submission(client_order_id);
+                            latch_algo_safety_error(&safety_error, &e);
+                            if let Some(venue_order_id) = deferred {
+                                let identity = OrderIdentity {
+                                    instrument_id,
+                                    strategy_id,
+                                    order_side,
+                                    order_type,
+                                    price,
+                                    quantity,
+                                    venue_position_id,
+                                };
+                                ensure_accepted_emitted(
+                                    client_order_id,
+                                    account_id,
+                                    venue_order_id,
+                                    &identity,
+                                    &emitter,
+                                    &dispatch_state,
+                                    clock.get_time_ns(),
+                                );
+                            }
+                            return Err(e);
+                        }
+
+                        if close_position && report.quantity.is_zero() {
+                            // Binance omits close-all quantity and the model parses it as zero.
+                            // Preserve the locally validated Native quantity before runtime
+                            // reconciliation so no zero-quantity OrderUpdated can be synthesized.
+                            report.quantity = quantity;
+                        }
+
+                        let emit_accepted = dispatch_state
+                            .order_identities
+                            .contains_key(&client_order_id)
+                            && dispatch_state.mark_accepted_once(client_order_id);
+                        let deferred = dispatch_state.finish_algo_submission(client_order_id);
+                        let identity_conflict = deferred
+                            .filter(|venue_order_id| *venue_order_id != report.venue_order_id)
+                            .map(|venue_order_id| {
+                                anyhow::anyhow!(
+                                    "Binance Futures Algo submit identity conflict for \
+                                     {client_order_id}: HTTP={}, stream={venue_order_id}",
+                                    report.venue_order_id,
+                                )
+                            });
+                        if let Some(error) = identity_conflict.as_ref() {
+                            latch_algo_safety_error(&safety_error, error);
+                        }
+
+                        dispatch_state
+                            .insert_algo_order_id(client_order_id, report.venue_order_id);
+                        if emit_accepted {
+                            let mut accepted = OrderAccepted::new(
+                                trader_id,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                report.venue_order_id,
+                                account_id,
+                                UUID4::new(),
+                                report.ts_accepted,
+                                clock.get_time_ns(),
+                                false,
+                            );
+                            accepted.causation_id = Some(report.report_id);
+                            emitter.send_order_event(OrderEventAny::Accepted(accepted));
+                        }
+                        emitter.send_order_status_report(report.clone());
+
+                        if let Some(error) = identity_conflict {
+                            return Err(error);
+                        }
+                    }
                     log::debug!(
                         "Order submit accepted: client_order_id={}, venue_order_id={}",
                         client_order_id,
@@ -897,10 +996,46 @@ impl BinanceFuturesExecutionClient {
                     );
                 }
                 Err(e) => {
+                    let deferred = use_algo_api
+                        .then(|| dispatch_state.finish_algo_submission(client_order_id))
+                        .flatten();
+
+                    if let Some(venue_order_id) = deferred {
+                        let identity = OrderIdentity {
+                            instrument_id,
+                            strategy_id,
+                            order_side,
+                            order_type,
+                            price,
+                            quantity,
+                            venue_position_id,
+                        };
+                        ensure_accepted_emitted(
+                            client_order_id,
+                            account_id,
+                            venue_order_id,
+                            &identity,
+                            &emitter,
+                            &dispatch_state,
+                            clock.get_time_ns(),
+                        );
+                        log::warn!(
+                            "Algo submit returned an error after stream acceptance for \
+                             {client_order_id}; preserving the venue state for reconciliation"
+                        );
+                        return Err(e);
+                    }
+
                     // Keep order registered on ambiguous evidence - if HTTP failed due to
                     // timeout but the order reached Binance, WebSocket updates will still
                     // arrive. The order resolves via the stream or reconciliation.
                     let http_error = e.downcast_ref::<BinanceFuturesHttpError>();
+                    if use_algo_api
+                        && (http_error.is_none()
+                            || matches!(http_error, Some(BinanceFuturesHttpError::JsonError(_))))
+                    {
+                        latch_algo_safety_error(&safety_error, &e);
+                    }
                     let failure = http_error.map_or_else(
                         || CommandFailure::Ambiguous(e.to_string()),
                         classify_futures_http_failure,
@@ -4307,6 +4442,90 @@ async fn query_algo_order_with_fills(
     Ok((report, fills))
 }
 
+#[expect(clippy::too_many_arguments)]
+fn validate_algo_submit_response(
+    report: &OrderStatusReport,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    order_side: nautilus_model::enums::OrderSide,
+    order_type: OrderType,
+    quantity: Quantity,
+    time_in_force: TimeInForce,
+    price: Option<nautilus_model::types::Price>,
+    trigger_price: Option<nautilus_model::types::Price>,
+    close_position: bool,
+    activation_price: Option<nautilus_model::types::Price>,
+    trailing_offset: Option<Decimal>,
+    trigger_type: Option<TriggerType>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        report.account_id == account_id
+            && report.instrument_id == instrument_id
+            && report.client_order_id == Some(client_order_id),
+        "Binance Futures Algo submit response returned a different order identity"
+    );
+    anyhow::ensure!(
+        report.order_side == Some(order_side)
+            && report.order_type == order_type
+            && report.time_in_force == time_in_force,
+        "Binance Futures Algo submit response returned different order semantics for \
+         {client_order_id}"
+    );
+    anyhow::ensure!(
+        report.order_status == OrderStatus::Accepted && report.filled_qty.is_zero(),
+        "Binance Futures Algo submit response for {client_order_id} was not an unfilled \
+         accepted order"
+    );
+    if close_position {
+        anyhow::ensure!(
+            report.quantity.is_zero() || report.quantity == quantity,
+            "Binance Futures close-position submit response returned an unexpected quantity for \
+             {client_order_id}"
+        );
+    } else {
+        anyhow::ensure!(
+            report.quantity == quantity,
+            "Binance Futures Algo submit response returned a different quantity for \
+             {client_order_id}"
+        );
+    }
+    anyhow::ensure!(
+        report.price == price,
+        "Binance Futures Algo submit response returned a different limit price for \
+         {client_order_id}"
+    );
+    let expected_trigger_type = match trigger_type {
+        Some(TriggerType::Default) => Some(TriggerType::LastPrice),
+        value => value,
+    };
+    anyhow::ensure!(
+        report.trigger_type == expected_trigger_type,
+        "Binance Futures Algo submit response returned a different working type for \
+         {client_order_id}"
+    );
+
+    if order_type == OrderType::TrailingStopMarket {
+        let activation_matches =
+            activation_price.is_none() || report.activation_price == activation_price;
+        anyhow::ensure!(
+            report.trigger_price.is_none()
+                && activation_matches
+                && report.trailing_offset == trailing_offset
+                && report.trailing_offset_type == Some(TrailingOffsetType::BasisPoints),
+            "Binance Futures trailing submit response did not echo the exact activation and \
+             callback intent for {client_order_id}"
+        );
+    } else {
+        anyhow::ensure!(
+            report.trigger_price == trigger_price,
+            "Binance Futures Algo submit response returned a different trigger price for \
+             {client_order_id}"
+        );
+    }
+    Ok(())
+}
+
 fn latch_algo_safety_error(safety_error: &OnceLock<String>, error: &anyhow::Error) {
     let reason = format!("Binance Futures Algo reconciliation safety failure: {error:#}");
     if safety_error.set(reason.clone()).is_ok() {
@@ -4652,6 +4871,77 @@ mod tests {
             status: 400,
             retry_after: None,
         })
+    }
+
+    fn trailing_submit_report() -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("BINANCE-001"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            Some(ClientOrderId::from("TRAILING-001")),
+            VenueOrderId::from("12345"),
+            Some(nautilus_model::enums::OrderSide::Sell),
+            OrderType::TrailingStopMarket,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("0.001"),
+            Quantity::zero(3),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(1_000_000_001),
+            Some(UUID4::new()),
+        )
+        .with_activation_price(Price::from("10000.00"))
+        .with_trigger_type(TriggerType::MarkPrice)
+        .with_trailing_offset(Decimal::from(25))
+        .with_trailing_offset_type(TrailingOffsetType::BasisPoints)
+        .with_reduce_only(true)
+    }
+
+    #[rstest]
+    fn test_validate_algo_submit_response_requires_exact_trailing_echo() {
+        let report = trailing_submit_report();
+        let validate = |report: &OrderStatusReport, trigger_type| {
+            validate_algo_submit_response(
+                report,
+                AccountId::from("BINANCE-001"),
+                InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+                ClientOrderId::from("TRAILING-001"),
+                nautilus_model::enums::OrderSide::Sell,
+                OrderType::TrailingStopMarket,
+                Quantity::from("0.001"),
+                TimeInForce::Gtc,
+                None,
+                None,
+                false,
+                Some(Price::from("10000.00")),
+                Some(Decimal::from(25)),
+                Some(trigger_type),
+            )
+        };
+
+        validate(&report, TriggerType::MarkPrice).unwrap();
+
+        let mut default_trigger = report.clone();
+        default_trigger.trigger_type = Some(TriggerType::LastPrice);
+        validate(&default_trigger, TriggerType::Default).unwrap();
+
+        let mut missing_activation = report.clone();
+        missing_activation.activation_price = None;
+        assert!(
+            validate(&missing_activation, TriggerType::MarkPrice)
+                .unwrap_err()
+                .to_string()
+                .contains("exact activation and callback intent")
+        );
+
+        let mut wrong_callback = report;
+        wrong_callback.trailing_offset = Some(Decimal::from(50));
+        assert!(
+            validate(&wrong_callback, TriggerType::MarkPrice)
+                .unwrap_err()
+                .to_string()
+                .contains("exact activation and callback intent")
+        );
     }
 
     #[rstest]

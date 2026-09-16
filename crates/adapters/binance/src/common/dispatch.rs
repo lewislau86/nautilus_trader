@@ -104,6 +104,7 @@ struct AlgoOrderIds {
 pub struct WsDispatchState {
     pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
     pub pending_requests: DashMap<String, PendingRequest>,
+    pending_algo_submissions: DashMap<ClientOrderId, Option<VenueOrderId>>,
     algo_order_ids: DashMap<ClientOrderId, AlgoOrderIds>,
     finished_algo_orders: Mutex<VecDeque<ClientOrderId>>,
     order_updates: DashMap<ClientOrderId, OrderUpdate>,
@@ -120,6 +121,7 @@ impl Default for WsDispatchState {
         Self {
             order_identities: DashMap::new(),
             pending_requests: DashMap::new(),
+            pending_algo_submissions: DashMap::new(),
             algo_order_ids: DashMap::new(),
             finished_algo_orders: Mutex::new(VecDeque::new()),
             order_updates: DashMap::new(),
@@ -137,9 +139,47 @@ impl WsDispatchState {
         self.emitted_accepted.lock().contains(cid)
     }
 
-    /// Marks an order as having emitted an OrderAccepted event.
+    /// Atomically marks an order as having emitted an `OrderAccepted` event.
+    ///
+    /// Returns `true` only for the caller which claimed the first emission.
+    pub fn mark_accepted_once(&self, cid: ClientOrderId) -> bool {
+        let mut emitted = self.emitted_accepted.lock();
+        if emitted.contains(&cid) {
+            return false;
+        }
+        emitted.add(cid);
+        true
+    }
+
+    /// Marks an order as accepted when the caller already owns serialization.
     pub fn insert_accepted(&self, cid: ClientOrderId) {
-        self.emitted_accepted.lock().add(cid);
+        let _ = self.mark_accepted_once(cid);
+    }
+
+    /// Registers an in-flight Algo HTTP submission before the request can race its stream update.
+    pub fn begin_algo_submission(&self, cid: ClientOrderId) {
+        self.pending_algo_submissions.insert(cid, None);
+    }
+
+    /// Defers the Algo stream's `NEW` acceptance while its HTTP response is still in flight.
+    ///
+    /// Returns `true` when the submission is pending and the venue identity was retained for the
+    /// HTTP completion path. A repeated `NEW` preserves the first identity.
+    pub fn defer_algo_acceptance(&self, cid: ClientOrderId, venue_order_id: VenueOrderId) -> bool {
+        let Some(mut deferred) = self.pending_algo_submissions.get_mut(&cid) else {
+            return false;
+        };
+        if deferred.is_none() {
+            *deferred = Some(venue_order_id);
+        }
+        true
+    }
+
+    /// Completes an Algo HTTP submission and returns any acceptance deferred from the stream.
+    pub fn finish_algo_submission(&self, cid: ClientOrderId) -> Option<VenueOrderId> {
+        self.pending_algo_submissions
+            .remove(&cid)
+            .and_then(|(_, venue_order_id)| venue_order_id)
     }
 
     pub fn has_filled(&self, cid: &ClientOrderId) -> bool {
@@ -323,6 +363,7 @@ impl WsDispatchState {
     /// Removes all routing state for a terminal or evicted order, not its native cached events.
     pub fn cleanup_terminal(&self, cid: ClientOrderId) {
         self.order_identities.remove(&cid);
+        self.pending_algo_submissions.remove(&cid);
         self.algo_order_ids.remove(&cid);
         self.order_updates.remove(&cid);
         self.replacements.remove(&cid);
@@ -358,10 +399,9 @@ pub fn ensure_accepted_emitted(
     state: &WsDispatchState,
     ts_init: UnixNanos,
 ) {
-    if state.has_emitted_accepted(&client_order_id) {
+    if !state.mark_accepted_once(client_order_id) {
         return;
     }
-    state.insert_accepted(client_order_id);
     let accepted = OrderAccepted::new(
         emitter.trader_id(),
         identity.strategy_id,
@@ -382,6 +422,29 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_algo_acceptance_is_deferred_until_http_submission_finishes() {
+        let state = WsDispatchState::default();
+        let cid = ClientOrderId::from("PENDING-ALGO");
+        let venue_order_id = VenueOrderId::from("12345");
+
+        state.begin_algo_submission(cid);
+        assert!(state.defer_algo_acceptance(cid, venue_order_id));
+        assert!(!state.has_emitted_accepted(&cid));
+        assert_eq!(state.finish_algo_submission(cid), Some(venue_order_id));
+        assert!(!state.defer_algo_acceptance(cid, venue_order_id));
+    }
+
+    #[rstest]
+    fn test_mark_accepted_once_has_one_winner() {
+        let state = WsDispatchState::default();
+        let cid = ClientOrderId::from("ACCEPTED-ONCE");
+
+        assert!(state.mark_accepted_once(cid));
+        assert!(!state.mark_accepted_once(cid));
+        assert!(state.has_emitted_accepted(&cid));
+    }
 
     #[rstest]
     fn test_finished_algo_retention_is_bounded_without_refreshing_duplicates() {
