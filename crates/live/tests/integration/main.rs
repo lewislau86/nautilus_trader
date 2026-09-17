@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#[cfg(feature = "python")]
+mod historical;
 mod manager;
 mod node;
 mod stress;

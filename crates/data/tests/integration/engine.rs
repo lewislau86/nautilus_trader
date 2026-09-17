@@ -32,14 +32,23 @@ use nautilus_common::messages::defi::{
     UnsubscribePoolSwaps,
 };
 use nautilus_common::{
+    actor::{
+        DataActor, DataActorCore,
+        data_actor::DataActorConfig,
+        indicators::ActorIndicator,
+        registry::{get_actor_unchecked, register_actor},
+    },
     cache::Cache,
     clients::DataClient,
     clock::{Clock, TestClock},
+    component::Component,
+    enums::ComponentState,
     messages::data::{
         BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-        DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-        OptionChainReferencePriceResponse, PARAMS_IS_PARENT, QuotesResponse, RequestBars,
-        RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCommand,
+        DataCommand, DataResponse, FundingRatesResponse, HistoricalBarsBatch,
+        HistoricalBarsOutcome, HistoricalBarsRequestFailure, InstrumentResponse,
+        InstrumentsResponse, OptionChainReferencePriceResponse, PARAMS_IS_PARENT, QuotesResponse,
+        RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCommand,
         RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments, RequestJoin,
         RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
         SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots, SubscribeCommand,
@@ -59,6 +68,7 @@ use nautilus_common::{
         stubs::{get_any_saving_handler, get_typed_message_saving_handler},
         switchboard::{self, MessagingSwitchboard},
     },
+    nautilus_actor,
     testing::wait_until,
 };
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, datetime::NANOSECONDS_IN_SECOND};
@@ -98,7 +108,9 @@ use nautilus_model::{
         AggressorSide, AssetClass, BookType, GreeksConvention, InstrumentClass,
         InstrumentCloseType, MarketStatusAction, OptionKind, PriceType, RecordFlag,
     },
-    identifiers::{ClientId, InstrumentId, OptionSeriesId, Symbol, TradeId, TraderId, Venue},
+    identifiers::{
+        ActorId, ClientId, InstrumentId, OptionSeriesId, Symbol, TradeId, TraderId, Venue,
+    },
     instruments::{
         CurrencyPair, FuturesContract, FuturesSpread, Instrument, InstrumentAny, OptionContract,
         SyntheticInstrument,
@@ -2084,6 +2096,4269 @@ fn test_request_scoped_composite_bar_aggregator_handles_bar_response(
             .map(|bar| bar.ts_event),
         Some(UnixNanos::from(1_000)),
     );
+}
+
+const HISTORICAL_SOURCE_START_NS: u64 = 1_735_689_600_000_000_000;
+const HISTORICAL_SOURCE_MINUTE_NS: u64 = 60_000_000_000;
+
+struct HistoricalSourceFixture {
+    engine: DataEngine,
+    cache: Rc<RefCell<Cache>>,
+    request: RequestBars,
+    response: BarsResponse,
+    target: BarType,
+    recorder: Rc<RefCell<Vec<DataCommand>>>,
+}
+
+#[derive(Debug)]
+struct HistoricalSourceActor {
+    core: DataActorCore,
+    received: Vec<Bar>,
+    live_bars: Vec<Bar>,
+    fail_lifecycle: bool,
+    fail_history_hook: bool,
+    fault_count: usize,
+    dispose_count: usize,
+    lifecycle_handler_ids: Vec<UUID4>,
+    lifecycle_handler_presence: Vec<bool>,
+    lifecycle_states: Vec<ComponentState>,
+    responses: Vec<BarsResponse>,
+    failures: Vec<HistoricalBarsRequestFailure>,
+    observed_indicators: Option<Rc<RefCell<Vec<Bar>>>>,
+    callback_indicator_counts: Vec<usize>,
+}
+
+nautilus_actor!(HistoricalSourceActor);
+
+impl HistoricalSourceActor {
+    fn record_history_retirement(&mut self) {
+        self.lifecycle_states.push(self.state());
+        let bus = msgbus::get_message_bus();
+        let bus = bus.borrow();
+        self.lifecycle_handler_presence = self
+            .lifecycle_handler_ids
+            .iter()
+            .map(|id| bus.get_response_handler(id).is_some())
+            .collect();
+    }
+}
+
+impl DataActor for HistoricalSourceActor {
+    fn on_historical_bars_request_failed(
+        &mut self,
+        failure: &HistoricalBarsRequestFailure,
+    ) -> anyhow::Result<()> {
+        self.failures.push(failure.clone());
+
+        if let Some(indicators) = &self.observed_indicators {
+            self.callback_indicator_counts
+                .push(indicators.borrow().len());
+        }
+        anyhow::ensure!(!self.fail_history_hook, "History hook failure");
+        Ok(())
+    }
+
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn on_stop(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fail_lifecycle, "Lifecycle hook failure");
+        Ok(())
+    }
+
+    fn on_reset(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fail_lifecycle, "Lifecycle hook failure");
+        Ok(())
+    }
+
+    fn on_fault(&mut self) -> anyhow::Result<()> {
+        self.fault_count += 1;
+        self.record_history_retirement();
+        anyhow::ensure!(!self.fail_lifecycle, "Lifecycle hook failure");
+        Ok(())
+    }
+
+    fn on_dispose(&mut self) -> anyhow::Result<()> {
+        self.dispose_count += 1;
+        self.record_history_retirement();
+        anyhow::ensure!(!self.fail_lifecycle, "Lifecycle hook failure");
+        Ok(())
+    }
+
+    fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        self.received.extend_from_slice(bars);
+        anyhow::ensure!(!self.fail_history_hook, "History hook failure");
+        Ok(())
+    }
+
+    fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
+        self.live_bars.push(*bar);
+        Ok(())
+    }
+
+    fn on_historical_bars_response(&mut self, response: &BarsResponse) -> anyhow::Result<()> {
+        self.responses.push(response.clone());
+
+        if let Some(indicators) = &self.observed_indicators {
+            self.callback_indicator_counts
+                .push(indicators.borrow().len());
+        }
+        self.on_historical_bars(&response.data)
+    }
+}
+
+fn historical_source_actor(cache: Rc<RefCell<Cache>>, actor_id: &str) -> Ustr {
+    let mut actor = HistoricalSourceActor {
+        core: DataActorCore::new(DataActorConfig {
+            actor_id: Some(ActorId::from(actor_id)),
+            ..DataActorConfig::default()
+        }),
+        received: Vec::new(),
+        live_bars: Vec::new(),
+        fail_lifecycle: false,
+        fail_history_hook: false,
+        fault_count: 0,
+        dispose_count: 0,
+        lifecycle_handler_ids: Vec::new(),
+        lifecycle_handler_presence: Vec::new(),
+        lifecycle_states: Vec::new(),
+        responses: Vec::new(),
+        failures: Vec::new(),
+        observed_indicators: None,
+        callback_indicator_counts: Vec::new(),
+    };
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock.borrow_mut().set_time(UnixNanos::from(
+        HISTORICAL_SOURCE_START_NS + 7 * HISTORICAL_SOURCE_MINUTE_NS,
+    ));
+    actor
+        .register(TraderId::test_default(), clock, cache)
+        .unwrap();
+    let id = actor.core.actor_id.inner();
+    register_actor(actor);
+    id
+}
+
+#[rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+fn test_historical_source_requester_stop_reset_while_engine_active_rejects_old_response(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] reset: bool,
+    #[case] dispatched: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let actor_id = historical_source_actor(cache.clone(), "SOURCE-OWNER");
+    let request_id = {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        if !reset {
+            actor.start().unwrap();
+        }
+        actor
+            .request_bars(
+                request.bar_type,
+                request.start,
+                request.end,
+                request.limit,
+                request.client_id,
+                request.params.clone(),
+            )
+            .unwrap()
+    };
+    response.correlation_id = request_id;
+    let command = queued.borrow_mut().remove(0);
+    if dispatched {
+        engine.execute(command.clone());
+    }
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        if reset {
+            actor.reset().unwrap();
+            actor.start().unwrap();
+        } else {
+            actor.stop().unwrap();
+            actor.resume().unwrap();
+        }
+    }
+
+    if !dispatched {
+        engine.execute(command);
+    }
+    // Cancellation may still be queued: the old response cannot win the command/response race.
+    engine.response(DataResponse::Bars(response.clone()));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert!(
+        get_actor_unchecked::<HistoricalSourceActor>(&actor_id)
+            .received
+            .is_empty()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request_id)
+            .is_none()
+    );
+
+    for command in queued.borrow_mut().drain(..) {
+        engine.execute(command);
+    }
+    let new_request_id = {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        actor
+            .request_bars(
+                request.bar_type,
+                request.start,
+                request.end,
+                request.limit,
+                request.client_id,
+                request.params,
+            )
+            .unwrap()
+    };
+    assert_ne!(new_request_id, request_id);
+    engine.execute(queued.borrow_mut().remove(0));
+    response.correlation_id = new_request_id;
+    engine.response(DataResponse::Bars(response.clone()));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        get_actor_unchecked::<HistoricalSourceActor>(&actor_id).received,
+        response.data
+    );
+}
+
+fn historical_source_actor_request(actor_id: &Ustr, request: &RequestBars) -> UUID4 {
+    get_actor_unchecked::<HistoricalSourceActor>(actor_id)
+        .request_bars(
+            request.bar_type,
+            request.start,
+            request.end,
+            request.limit,
+            request.client_id,
+            request.params.clone(),
+        )
+        .unwrap()
+}
+
+#[rstest]
+#[case(0, false)]
+#[case(0, true)]
+#[case(1, false)]
+#[case(1, true)]
+#[case(2, false)]
+#[case(2, true)]
+#[case(3, false)]
+#[case(3, true)]
+fn test_historical_source_requester_cancels_before_successful_or_failed_lifecycle_hook(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] lifecycle: u8,
+    #[case] fail: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let actor_id = historical_source_actor(cache.clone(), "SOURCE-OWNER");
+    if lifecycle == 0 || lifecycle == 2 {
+        get_actor_unchecked::<HistoricalSourceActor>(&actor_id)
+            .start()
+            .unwrap();
+    }
+    let request_id = historical_source_actor_request(&actor_id, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        actor.fail_lifecycle = fail;
+        let result = match lifecycle {
+            0 => actor.stop(),
+            1 => actor.reset(),
+            2 => actor.fault(),
+            _ => actor.dispose(),
+        };
+        assert_eq!(result.is_err(), fail);
+        if lifecycle != 1 || fail {
+            assert!(
+                actor
+                    .request_bars(
+                        request.bar_type,
+                        request.start,
+                        request.end,
+                        request.limit,
+                        request.client_id,
+                        request.params.clone()
+                    )
+                    .is_err()
+            );
+        }
+    }
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request_id)
+            .is_none()
+    );
+    response.correlation_id = request_id;
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert!(
+        get_actor_unchecked::<HistoricalSourceActor>(&actor_id)
+            .received
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_historical_source_requester_cancellation_drains_time_range_without_reply_and_preserves_sibling(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("time_range_generator".to_string(), json!(""));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("durations_seconds".to_string(), json!([60]));
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let owner = historical_source_actor(cache.clone(), "SOURCE-OWNER");
+    let sibling = historical_source_actor(cache.clone(), "SOURCE-SIBLING");
+    let owner_id = historical_source_actor_request(&owner, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    let child = recorded_bars_request(&recorder, 0);
+    let mut first = response.clone();
+    first.correlation_id = child.request_id;
+    first.data = vec![response.data[0]];
+    engine.response(DataResponse::Bars(first));
+    let late_child = recorded_bars_request(&recorder, 1);
+    let sibling_id = historical_source_actor_request(&sibling, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    assert_eq!(engine.time_range_pipeline_count(), 2);
+    get_actor_unchecked::<HistoricalSourceActor>(&owner)
+        .reset()
+        .unwrap();
+    assert!(
+        matches!(queued.borrow().as_slice(), [DataCommand::CancelHistoricalBars(id)] if *id == owner_id)
+    );
+    engine.execute(queued.borrow_mut().remove(0));
+    // No reply from the canceled child is required to release its staged parent.
+    assert_eq!(engine.time_range_pipeline_count(), 1);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&owner_id)
+            .is_none()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&sibling_id)
+            .is_some()
+    );
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    let mut late = response.clone();
+    late.correlation_id = late_child.request_id;
+    late.data = vec![response.data[1]];
+    engine.response(DataResponse::Bars(late));
+
+    for index in 0..7 {
+        let child = recorded_bars_request(&recorder, index + 2);
+        let mut part = response.clone();
+        part.correlation_id = child.request_id;
+        part.data = vec![response.data[index]];
+        engine.response(DataResponse::Bars(part));
+    }
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert!(
+        get_actor_unchecked::<HistoricalSourceActor>(&owner)
+            .received
+            .is_empty()
+    );
+    assert_eq!(
+        get_actor_unchecked::<HistoricalSourceActor>(&sibling).received,
+        response.data
+    );
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_historical_source_requester_cancellation_drains_catalog_fanin_without_reply_and_preserves_sibling(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let _catalog = register_bar_catalog_with_bars(
+        &mut engine,
+        "source-cancel-fanin",
+        &response.data[..4],
+        Some((
+            HISTORICAL_SOURCE_START_NS - HISTORICAL_SOURCE_MINUTE_NS,
+            response.data[3].ts_event.as_u64(),
+        )),
+    );
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let owner = historical_source_actor(cache.clone(), "SOURCE-OWNER");
+    let sibling = historical_source_actor(cache.clone(), "SOURCE-SIBLING");
+    let owner_id = historical_source_actor_request(&owner, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    let late_child = recorded_bars_request(&recorder, 0);
+    let sibling_id = historical_source_actor_request(&sibling, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    assert_eq!(engine.request_pipeline_count(), 2);
+    get_actor_unchecked::<HistoricalSourceActor>(&owner)
+        .reset()
+        .unwrap();
+    engine.execute(queued.borrow_mut().remove(0));
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&owner_id)
+            .is_none()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&sibling_id)
+            .is_some()
+    );
+    let mut late = response.clone();
+    late.correlation_id = late_child.request_id;
+    late.data = response.data[4..].to_vec();
+    engine.response(DataResponse::Bars(late));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    let sibling_child = recorded_bars_request(&recorder, 1);
+    let mut valid = response.clone();
+    valid.correlation_id = sibling_child.request_id;
+    valid.data = response.data[4..].to_vec();
+    engine.response(DataResponse::Bars(valid));
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert!(
+        get_actor_unchecked::<HistoricalSourceActor>(&owner)
+            .received
+            .is_empty()
+    );
+    assert_eq!(
+        get_actor_unchecked::<HistoricalSourceActor>(&sibling).received,
+        response.data
+    );
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+}
+
+// Exercises real DataEngine response/cache/aggregation effects with an existing recording client
+fn historical_source_engine(
+    instrument: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    validate: bool,
+) -> HistoricalSourceFixture {
+    historical_source_engine_with_clock(instrument, client_id, venue, validate).0
+}
+
+fn historical_source_engine_with_clock(
+    instrument: CurrencyPair,
+    client_id: ClientId,
+    venue: Venue,
+    validate: bool,
+) -> (HistoricalSourceFixture, Rc<RefCell<TestClock>>) {
+    let instrument_id = instrument.id;
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(instrument))
+        .unwrap();
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock.borrow_mut().set_time(UnixNanos::from(
+        HISTORICAL_SOURCE_START_NS + 7 * HISTORICAL_SOURCE_MINUTE_NS,
+    ));
+    let config = DataEngineConfig::builder()
+        .validate_historical_bars(validate)
+        .build();
+    let mut engine = DataEngine::new(clock.clone(), cache.clone(), Some(config));
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock.clone(),
+        cache.clone(),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine,
+    );
+
+    // In-memory transport fixtures retain Native queue commands for the caller's event loop
+    let queue_recorder = recorder.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| {
+            queue_recorder.borrow_mut().push(command);
+        }),
+    );
+
+    let composite =
+        BarType::from(format!("{instrument_id}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str());
+    let source = composite.composite();
+    let params = params_from_json(json!({
+        "bar_types": [composite.to_string()],
+        "update_subscriptions": false,
+        "skip_first_non_full_bar": true,
+        "disable_build_with_no_updates": true,
+    }));
+    let request = RequestBars::new(
+        source,
+        Some(
+            UnixNanos::from(HISTORICAL_SOURCE_START_NS - HISTORICAL_SOURCE_MINUTE_NS)
+                .to_datetime_utc(),
+        ),
+        Some(
+            UnixNanos::from(
+                HISTORICAL_SOURCE_START_NS + 6 * HISTORICAL_SOURCE_MINUTE_NS - 1_000_000,
+            )
+            .to_datetime_utc(),
+        ),
+        NonZeroUsize::new(7),
+        Some(client_id),
+        UUID4::new(),
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS),
+        Some(params.clone()),
+    );
+    let bars = (0..7)
+        .map(|index| {
+            make_bar(
+                source,
+                "0.65000",
+                "0.66000",
+                "0.64000",
+                "0.65500",
+                100,
+                HISTORICAL_SOURCE_START_NS + index * HISTORICAL_SOURCE_MINUTE_NS - 1_000_000,
+            )
+        })
+        .collect();
+    let response = BarsResponse::new(
+        request.request_id,
+        client_id,
+        source,
+        bars,
+        None,
+        None,
+        request.ts_init,
+        Some(params),
+    );
+    (
+        HistoricalSourceFixture {
+            engine,
+            cache,
+            request,
+            response,
+            target: composite.standard(),
+            recorder,
+        },
+        clock,
+    )
+}
+
+#[rstest]
+#[case::no_reply(0)]
+#[case::late_before_timeout_command(1)]
+#[case::time_range_missing_child(2)]
+fn test_historical_deadline_completes_original_once_without_cache_or_sibling_loss(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] mode: u8,
+) {
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            mut request,
+            response,
+            target,
+            recorder,
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    let started = clock.borrow().timestamp_ns();
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(2));
+
+    if mode == 2 {
+        request
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("time_range_generator".to_string(), json!(""));
+        request
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("durations_seconds".to_string(), json!([60]));
+    }
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let (failure_handler, failures) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, failure_handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let mut late = response.clone();
+
+    if mode == 2 {
+        clock
+            .borrow_mut()
+            .set_time(UnixNanos::from(started.as_u64() + 1_000_000));
+        let child = recorded_bars_request(&recorder, 0);
+        let mut first = response.clone();
+        first.correlation_id = child.request_id;
+        first.data = vec![response.data[0]];
+        first
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("historical_bars_timeout_ms".to_string(), json!(100));
+        engine.response(DataResponse::Bars(first));
+        let next = recorded_bars_request(&recorder, 1);
+        late.correlation_id = next.request_id;
+        late.data = vec![response.data[1]];
+        assert_eq!(engine.time_range_pipeline_count(), 1);
+    }
+    let mut sibling = request.clone();
+    sibling.request_id = UUID4::new();
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .shift_remove("time_range_generator");
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .shift_remove("durations_seconds");
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(100));
+    let (sibling_handler, sibling_replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&sibling.request_id, sibling_handler);
+    engine
+        .execute_request(RequestCommand::Bars(sibling.clone()))
+        .unwrap();
+    assert_eq!(clock.borrow().timer_count(), 1);
+    let expired = UnixNanos::from(started.as_u64() + 2_000_000);
+    let events = clock.borrow_mut().advance_time(expired, true);
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.run();
+    }
+    assert!(
+        failures.get_messages().is_empty(),
+        "The clock callback only enqueues Native work"
+    );
+    assert!(matches!(
+        queued.borrow().as_slice(),
+        [DataCommand::ExpireHistoricalBars]
+    ));
+
+    if mode == 1 {
+        engine.response(DataResponse::Bars(late.clone()));
+    }
+    let commands = std::mem::take(&mut *queued.borrow_mut());
+    for command in commands {
+        engine.execute(command);
+    }
+    let observed = failures.get_messages();
+    assert_eq!(
+        observed.len(),
+        1,
+        "A missing reply must complete the original Native request"
+    );
+    let failed = &observed[0];
+    assert_eq!(failed.request.request_id, request.request_id);
+    assert_eq!(failed.request.bar_type, request.bar_type);
+    assert_eq!(failed.request.start, request.start);
+    assert_eq!(failed.request.end, request.end);
+    assert_eq!(failed.request.limit, request.limit);
+    assert_eq!(failed.request.params, request.params);
+    assert_eq!(failed.request.ts_init, request.ts_init);
+    assert_eq!(failed.client_id, Some(client_id));
+    assert_eq!(failed.aggregate_bar_types, vec![target]);
+    assert_eq!(failed.ts_init, expired);
+    assert!(failed.error.contains("timed out"));
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&sibling.request_id)
+            .is_some()
+    );
+    engine.response(DataResponse::Bars(late.clone()));
+    engine.response(DataResponse::Bars(response.clone()));
+    assert_eq!(failures.get_messages().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    let mut healthy = response;
+    healthy.correlation_id = sibling.request_id;
+    engine.response(DataResponse::Bars(healthy));
+    assert_eq!(sibling_replies.get_messages().len(), 1);
+    assert!(matches!(
+        sibling_replies.get_messages()[0].historical_outcome,
+        Some(HistoricalBarsOutcome::Validated { .. })
+    ));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    let source_snapshot = cache.borrow().bars(&request.bar_type);
+    let target_snapshot = cache.borrow().bars(&target);
+    engine.response(DataResponse::Bars(late));
+    assert_eq!(cache.borrow().bars(&request.bar_type), source_snapshot);
+    assert_eq!(cache.borrow().bars(&target), target_snapshot);
+    assert_eq!(failures.get_messages().len(), 1);
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+#[case::zero(json!(0))]
+#[case::negative(json!(-1))]
+#[case::fraction(json!(0.5))]
+#[case::string(json!("2"))]
+#[case::boolean(json!(true))]
+#[case::null(json!(null))]
+#[case::overflow(json!(u64::MAX))]
+#[case::deadline_overflow(json!(u64::MAX / 1_000_000))]
+fn test_historical_deadline_invalid_original_budget_is_admission_metadata(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] budget: Value,
+) {
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            mut request,
+            target,
+            recorder,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), budget);
+    let (handler, saver) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    assert!(
+        engine
+            .execute_request(RequestCommand::Bars(request.clone()))
+            .is_err()
+    );
+    let failures = saver.get_messages();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].request.params, request.params);
+    assert_eq!(failures[0].request.request_id, request.request_id);
+    assert_eq!(failures[0].client_id, Some(client_id));
+    assert_eq!(failures[0].aggregate_bar_types, vec![target]);
+    assert!(failures[0].error.contains("historical_bars_timeout_ms"));
+    assert!(recorder.borrow().is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert_eq!(clock.borrow().timer_count(), 0);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+}
+
+#[rstest]
+fn test_historical_deadline_requires_native_queue_only_when_opted_in(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[values(false, true)] validate: bool,
+) {
+    let _ = stub_msgbus;
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            request,
+            target,
+            recorder,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, validate);
+    let bus =
+        MessageBus::new(TraderId::test_default(), UUID4::new(), None, None).register_message_bus();
+    assert!(!msgbus::has_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute()
+    ));
+    let (handler, saver) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    let result = engine.execute_request(RequestCommand::Bars(request.clone()));
+    assert_eq!(result.is_err(), validate);
+    assert_eq!(saver.get_messages().len(), usize::from(validate));
+    if validate {
+        let failure = &saver.get_messages()[0];
+        assert_eq!(failure.request.request_id, request.request_id);
+        assert_eq!(failure.request.params, request.params);
+        assert_eq!(failure.client_id, Some(client_id));
+        assert!(failure.error.contains("data command queue"));
+        assert!(recorder.borrow().is_empty());
+        assert!(
+            bus.borrow()
+                .get_response_handler(&request.request_id)
+                .is_none()
+        );
+    } else {
+        assert_eq!(recorder.borrow().len(), 1);
+        assert!(
+            bus.borrow()
+                .get_response_handler(&request.request_id)
+                .is_some()
+        );
+    }
+    assert_eq!(clock.borrow().timer_count(), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case::cancel(0)]
+#[case::stop(1)]
+#[case::reset(2)]
+fn test_historical_deadline_retired_old_alert_preserves_new_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] action: u8,
+) {
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            mut request,
+            response,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(2));
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let (handler, failures) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let expired = UnixNanos::from(clock.borrow().timestamp_ns().as_u64() + 2_000_000);
+    let events = clock.borrow_mut().advance_time(expired, true);
+    let old_handlers = clock.borrow().match_handlers(events);
+    assert_eq!(old_handlers.len(), 1);
+
+    match action {
+        0 => engine.execute(DataCommand::CancelHistoricalBars(request.request_id)),
+        1 => engine.stop(),
+        2 => engine.reset(),
+        _ => unreachable!(),
+    }
+    assert_eq!(clock.borrow().timer_count(), 0);
+    let mut next = request.clone();
+    next.request_id = UUID4::new();
+    next.params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(100));
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&next.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(next.clone()))
+        .unwrap();
+
+    for handler in old_handlers {
+        handler.clone().run();
+        handler.run();
+    }
+    let commands = std::mem::take(&mut *queued.borrow_mut());
+    assert_eq!(commands.len(), 2);
+    for command in commands {
+        engine.execute(command);
+    }
+    engine.response(DataResponse::Bars(response.clone()));
+    assert!(failures.get_messages().is_empty());
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&next.request_id)
+            .is_some()
+    );
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert_eq!(clock.borrow().timer_count(), 1);
+    let mut healthy = response;
+    healthy.correlation_id = next.request_id;
+    engine.response(DataResponse::Bars(healthy));
+    assert_eq!(replies.get_messages().len(), 1);
+    assert!(matches!(
+        replies.get_messages()[0].historical_outcome,
+        Some(HistoricalBarsOutcome::Validated { .. })
+    ));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+fn test_historical_deadline_default_budget_uses_engine_clock_not_request_timestamp(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            request,
+            response,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    let started = clock.borrow().timestamp_ns();
+    assert!(request.ts_init < started);
+    assert!(
+        !request
+            .params
+            .as_ref()
+            .unwrap()
+            .contains_key("historical_bars_timeout_ms")
+    );
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let (handler, failures) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let expires_at = UnixNanos::from(started.as_u64() + 30_000_000_000);
+    let events = clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(expires_at.as_u64() - 1), true);
+    assert!(events.is_empty());
+    assert!(queued.borrow().is_empty());
+    assert!(failures.get_messages().is_empty());
+    let events = clock.borrow_mut().advance_time(expires_at, true);
+    let handlers = clock.borrow().match_handlers(events);
+    assert_eq!(handlers.len(), 1);
+    for handler in handlers {
+        handler.run();
+    }
+    let commands = std::mem::take(&mut *queued.borrow_mut());
+    assert!(matches!(
+        commands.as_slice(),
+        [DataCommand::ExpireHistoricalBars]
+    ));
+
+    for command in commands {
+        engine.execute(command);
+    }
+    let observed = failures.get_messages();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].request.request_id, request.request_id);
+    assert_eq!(observed[0].request.ts_init, request.ts_init);
+    assert_eq!(observed[0].request.params, request.params);
+    assert_eq!(observed[0].ts_init, expires_at);
+    assert!(observed[0].error.contains("30000 ms"));
+    engine.response(DataResponse::Bars(response));
+    engine.execute(DataCommand::ExpireHistoricalBars);
+    assert_eq!(failures.get_messages().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_historical_deadline_discards_catalog_fanin_and_nested_time_range(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[values(false, true)] nested: bool,
+) {
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            mut request,
+            response,
+            target,
+            recorder,
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    let _catalog = register_bar_catalog_with_bars(
+        &mut engine,
+        "deadline-catalog-fanin",
+        &response.data[..2],
+        Some((
+            HISTORICAL_SOURCE_START_NS - HISTORICAL_SOURCE_MINUTE_NS,
+            response.data[1].ts_event.as_u64(),
+        )),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(2));
+
+    if nested {
+        request
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("time_range_generator".to_string(), json!(""));
+        request
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("durations_seconds".to_string(), json!([240]));
+    }
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let (handler, failures) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let late_child = recorded_bars_request(&recorder, 0);
+    assert_ne!(late_child.request_id, request.request_id);
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert_eq!(engine.time_range_pipeline_count(), usize::from(nested));
+    let mut sibling = request.clone();
+    sibling.request_id = UUID4::new();
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .shift_remove("time_range_generator");
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .shift_remove("durations_seconds");
+    sibling
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("historical_bars_timeout_ms".to_string(), json!(100));
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&sibling.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(sibling.clone()))
+        .unwrap();
+    let sibling_child = recorded_bars_request(&recorder, 1);
+    assert_eq!(engine.request_pipeline_count(), 2);
+    assert_eq!(clock.borrow().timer_count(), 1);
+    let expires_at = UnixNanos::from(clock.borrow().timestamp_ns().as_u64() + 2_000_000);
+    let events = clock.borrow_mut().advance_time(expires_at, true);
+    let handlers = clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.run();
+    }
+    let commands = std::mem::take(&mut *queued.borrow_mut());
+    for command in commands {
+        engine.execute(command);
+    }
+    let observed = failures.get_messages();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].request.request_id, request.request_id);
+    assert_eq!(observed[0].request.params, request.params);
+    assert_eq!(observed[0].request.start, request.start);
+    assert_eq!(observed[0].request.end, request.end);
+    assert_eq!(observed[0].client_id, Some(client_id));
+    assert_eq!(observed[0].aggregate_bar_types, vec![target]);
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&sibling.request_id)
+            .is_some()
+    );
+    let mut late = response.clone();
+    late.correlation_id = late_child.request_id;
+    late.data = response.data[2..].to_vec();
+    engine.response(DataResponse::Bars(late));
+    engine.response(DataResponse::Bars(response.clone()));
+    assert_eq!(failures.get_messages().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    let mut healthy = response.clone();
+    healthy.correlation_id = sibling_child.request_id;
+    healthy.data = response.data[2..].to_vec();
+    engine.response(DataResponse::Bars(healthy));
+    let observed = replies.get_messages();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].data, response.data);
+    assert_historical_target_output(&observed[0], target, 500);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(clock.borrow().timer_count(), 0);
+}
+
+#[rstest]
+#[case::no_source(0)]
+#[case::unresolved_hint(1)]
+#[case::missing_start(2)]
+#[case::missing_end(3)]
+#[case::missing_limit(4)]
+#[case::insufficient_limit(5)]
+#[case::unsupported_source(6)]
+#[case::continuous_future(7)]
+#[case::pre_epoch(8)]
+#[case::reversed_bounds(9)]
+fn test_historical_admission_failure_replies_once_with_original_intent(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] failure: u8,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+
+    match failure {
+        0 => {
+            engine.deregister_client(&client_id);
+            request.client_id = None;
+        }
+        1 => {
+            engine.deregister_client(&client_id);
+            request.client_id = Some(ClientId::from("UNRESOLVED-HINT"));
+        }
+        2 => request.start = None,
+        3 => request.end = None,
+        4 => request.limit = None,
+        5 => request.limit = NonZeroUsize::new(1),
+        6 => {
+            request.bar_type = BarType::from(
+                format!(
+                    "{}-5-MINUTE-LAST-EXTERNAL",
+                    request.bar_type.instrument_id()
+                )
+                .as_str(),
+            );
+        }
+        7 => {
+            request
+                .params
+                .as_mut()
+                .unwrap()
+                .insert("continuous_future_transitions".to_string(), json!([]));
+        }
+        8 => request.start = Some(jiff::Timestamp::from_nanosecond(-1).unwrap()),
+        9 => {
+            request.start = request
+                .end
+                .map(|end| jiff::Timestamp::from_nanosecond(end.as_nanosecond() + 1).unwrap());
+        }
+        _ => unreachable!(),
+    }
+    let (handler, saver) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+
+    let result = engine.execute_request(RequestCommand::Bars(request.clone()));
+    assert!(
+        result.is_err(),
+        "Invalid intent must still return an Engine error"
+    );
+    let replies = saver.get_messages();
+    assert_eq!(
+        replies.len(),
+        1,
+        "Admission errors must complete the original request"
+    );
+    let failed = &replies[0];
+    assert_eq!(failed.request.request_id, request.request_id);
+    assert_eq!(failed.request.client_id, request.client_id);
+    assert_eq!(failed.request.bar_type, request.bar_type);
+    assert_eq!(failed.request.start, request.start);
+    assert_eq!(failed.request.end, request.end);
+    assert_eq!(failed.request.limit, request.limit);
+    assert_eq!(failed.request.ts_init, request.ts_init);
+    assert_eq!(failed.request.params, request.params);
+    assert_eq!(failed.aggregate_bar_types, vec![target]);
+    assert_eq!(
+        failed.client_id,
+        (!matches!(failure, 0 | 1 | 7)).then_some(client_id)
+    );
+    assert!(failed.error.contains(&result.unwrap_err().to_string()));
+    assert_eq!(
+        failed.ts_init,
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS + 7 * HISTORICAL_SOURCE_MINUTE_NS,)
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+    assert!(recorder.borrow().is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(saver.get_messages().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+fn validated_historical_batches(response: &BarsResponse) -> &[HistoricalBarsBatch] {
+    let Some(HistoricalBarsOutcome::Validated { aggregates }) = &response.historical_outcome else {
+        panic!("Expected engine-authored validated historical outcome");
+    };
+    aggregates
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_admission_duplicate_keeps_first_original_handler(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] malformed_duplicate: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let mut duplicate = request.clone();
+    if malformed_duplicate {
+        duplicate.start = None;
+        duplicate.params = Some(Params::default());
+    }
+    assert!(
+        engine
+            .execute_request(RequestCommand::Bars(duplicate))
+            .unwrap_err()
+            .to_string()
+            .contains("already active")
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_some()
+    );
+    assert!(replies.get_messages().is_empty());
+    assert_eq!(recorder.borrow().len(), 1);
+
+    engine.response(DataResponse::Bars(response));
+    let delivered = replies.get_messages();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].correlation_id, request.request_id);
+    assert_eq!(delivered[0].params, request.params);
+    assert_historical_target_output(&delivered[0], target, 500);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+}
+
+#[rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+fn test_historical_admission_client_failure_envelopes_cannot_complete_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] validated: bool,
+    #[case] unknown: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, validated);
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    let mut forged_request = request.clone();
+    if unknown {
+        forged_request.request_id = UUID4::new();
+    }
+    engine.response(DataResponse::BarsRequestFailed(Box::new(
+        HistoricalBarsRequestFailure {
+            request: forged_request,
+            client_id: None,
+            error: "forged completion".to_string(),
+            aggregate_bar_types: vec![target],
+            ts_init: UnixNanos::from(1),
+        },
+    )));
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_some()
+    );
+    assert!(replies.get_messages().is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+
+    engine.response(DataResponse::Bars(response));
+    let delivered = replies.get_messages();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].historical_outcome.is_some(), validated);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+}
+
+#[rstest]
+fn test_historical_admission_child_capture_error_completes_original_parent(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.new_request_pipeline(RequestCommand::Bars(request.clone()), 1);
+    let mut child = request.clone();
+    child.request_id = UUID4::new();
+    child.start = None;
+    engine.register_request_pipeline_leg(child.request_id, request.request_id);
+    assert!(
+        engine
+            .execute_request(RequestCommand::Bars(child.clone()))
+            .is_err()
+    );
+    let delivered = replies.get_messages();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].correlation_id, request.request_id);
+    assert_eq!(delivered[0].client_id, client_id);
+    assert_eq!(delivered[0].start, request.start.map(Into::into));
+    assert!(delivered[0].data.is_empty());
+    let Some(HistoricalBarsOutcome::Failed {
+        error,
+        aggregate_bar_types,
+    }) = &delivered[0].historical_outcome
+    else {
+        panic!("Child admission must fail the original parent");
+    };
+    assert!(error.contains("Missing historical source start"));
+    assert_eq!(aggregate_bar_types, &vec![target]);
+    assert_eq!(recorder.borrow().len(), 1);
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+    response.correlation_id = child.request_id;
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(replies.get_messages().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case(0)]
+#[case(1)]
+#[case(2)]
+fn test_historical_admission_uncaptured_pipeline_parent_retains_original_failure(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] depth: usize,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, replies) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    let mut unrelated = request.clone();
+    unrelated.request_id = UUID4::new();
+    engine.new_request_pipeline(RequestCommand::Bars(unrelated), 1);
+    engine.new_request_pipeline(RequestCommand::Bars(request.clone()), 1);
+    let mut parent_id = request.request_id;
+    for index in 0..depth {
+        let mut intermediate = request.clone();
+        intermediate.request_id = UUID4::new();
+        intermediate
+            .params
+            .as_mut()
+            .unwrap()
+            .insert("intermediate".to_string(), serde_json::json!(index));
+        engine.new_request_pipeline(RequestCommand::Bars(intermediate.clone()), 1);
+        engine.register_request_pipeline_leg(intermediate.request_id, parent_id);
+        parent_id = intermediate.request_id;
+    }
+    let mut child = request.clone();
+    child.request_id = UUID4::new();
+    engine.register_request_pipeline_leg(child.request_id, parent_id);
+    assert_eq!(engine.request_pipeline_count(), depth + 2);
+    let e = engine
+        .execute_request(RequestCommand::Bars(child.clone()))
+        .unwrap_err();
+    assert!(e.to_string().contains("no original parent"));
+    let delivered = replies.get_messages();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "Frozen pipeline intent must not lose parent completion"
+    );
+    assert_eq!(delivered[0].request.request_id, request.request_id);
+    assert_eq!(delivered[0].request.bar_type, request.bar_type);
+    assert_eq!(delivered[0].request.client_id, request.client_id);
+    assert_eq!(delivered[0].request.start, request.start);
+    assert_eq!(delivered[0].request.end, request.end);
+    assert_eq!(delivered[0].request.params, request.params);
+    assert!(
+        delivered[0].client_id.is_none(),
+        "A child source cannot invent a resolved parent source"
+    );
+    assert_eq!(delivered[0].aggregate_bar_types, vec![target]);
+    assert_eq!(
+        engine.request_pipeline_count(),
+        1,
+        "Unrelated staging must remain intact"
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+    assert!(recorder.borrow().is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+
+    for correlation_id in [child.request_id, parent_id, request.request_id] {
+        response.correlation_id = correlation_id;
+        engine.response(DataResponse::Bars(response.clone()));
+    }
+    assert_eq!(replies.get_messages().len(), 1);
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_admission_unresolvable_ancestry_completes_only_known_intent(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] cyclic: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let foreign_id = UUID4::new();
+    let (handler, replies) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    let (foreign_handler, foreign_replies) =
+        get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    msgbus::register_response_handler(&foreign_id, foreign_handler);
+    engine.new_request_pipeline(RequestCommand::Bars(request.clone()), 1);
+    let mut unrelated = request.clone();
+    unrelated.request_id = UUID4::new();
+    engine.new_request_pipeline(RequestCommand::Bars(unrelated), 1);
+    engine.register_request_pipeline_leg(
+        request.request_id,
+        if cyclic {
+            request.request_id
+        } else {
+            foreign_id
+        },
+    );
+    let e = engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap_err();
+    assert!(e.to_string().contains("no original parent"));
+    let delivered = replies.get_messages();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "Known Native intent must receive its admission failure"
+    );
+    assert_eq!(delivered[0].request.request_id, request.request_id);
+    assert_eq!(delivered[0].request.params, request.params);
+    assert_eq!(delivered[0].request.start, request.start);
+    assert_eq!(delivered[0].request.end, request.end);
+    assert_eq!(delivered[0].client_id, Some(client_id));
+    assert_eq!(delivered[0].aggregate_bar_types, vec![target]);
+    assert!(
+        delivered[0]
+            .error
+            .contains(if cyclic { "cyclic" } else { "intent missing" })
+    );
+    assert!(foreign_replies.get_messages().is_empty());
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&foreign_id)
+            .is_some()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_none()
+    );
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert!(recorder.borrow().is_empty());
+
+    for correlation_id in [request.request_id, foreign_id] {
+        response.correlation_id = correlation_id;
+        engine.response(DataResponse::Bars(response.clone()));
+    }
+    assert_eq!(replies.get_messages().len(), 1);
+    assert!(foreign_replies.get_messages().is_empty());
+    assert_eq!(engine.request_pipeline_count(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_admission_external_route_preserves_default_and_fails_opt_in(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] validated: bool,
+) {
+    let (
+        HistoricalSourceFixture {
+            cache,
+            request,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, validated);
+    let mut engine = DataEngine::new(
+        clock,
+        cache.clone(),
+        Some(DataEngineConfig {
+            validate_historical_bars: validated,
+            external_clients: Some(vec![client_id]),
+            ..DataEngineConfig::default()
+        }),
+    );
+    let (handler, replies) = get_any_saving_handler::<HistoricalBarsRequestFailure>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    assert_eq!(
+        engine
+            .execute_request(RequestCommand::Bars(request.clone()))
+            .is_err(),
+        validated
+    );
+    let delivered = replies.get_messages();
+    assert_eq!(delivered.len(), usize::from(validated));
+    if validated {
+        assert_eq!(delivered[0].request.request_id, request.request_id);
+        assert_eq!(delivered[0].request.client_id, Some(client_id));
+        assert!(delivered[0].client_id.is_none());
+        assert_eq!(delivered[0].aggregate_bar_types, vec![target]);
+        assert!(delivered[0].error.contains("externally routed clients"));
+    }
+    assert_eq!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request.request_id)
+            .is_some(),
+        !validated
+    );
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+fn test_historical_admission_actual_actor_receives_failure_and_retires_pending_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let actor_id = historical_source_actor(cache.clone(), "ADMISSION-OWNER");
+    let indicators = Rc::new(RefCell::new(Vec::new()));
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        actor.start().unwrap();
+        actor.observed_indicators = Some(indicators.clone());
+        for bar_type in [request.bar_type, target] {
+            actor.core.register_indicator_for_bars(
+                bar_type,
+                Rc::new(HistoricalTargetIndicator {
+                    bars: indicators.clone(),
+                    fail: false,
+                }),
+            );
+        }
+    }
+    request.limit = None;
+    let request_id = historical_source_actor_request(&actor_id, &request);
+    let DataCommand::Request(command) = queued.borrow_mut().remove(0) else {
+        panic!("Actor must use the Native request route");
+    };
+    assert!(engine.execute_request(command).is_err());
+    {
+        let actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        assert_eq!(actor.failures.len(), 1);
+        assert_eq!(actor.failures[0].request.request_id, request_id);
+        assert_eq!(actor.failures[0].client_id, Some(client_id));
+        assert_eq!(actor.callback_indicator_counts, vec![0]);
+        assert!(actor.received.is_empty());
+        assert!(actor.responses.is_empty());
+    }
+    assert!(indicators.borrow().is_empty());
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&request_id)
+            .is_none()
+    );
+    get_actor_unchecked::<HistoricalSourceActor>(&actor_id)
+        .stop()
+        .unwrap();
+    assert!(
+        queued.borrow().is_empty(),
+        "Completed failure must not remain pending for cancellation"
+    );
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[cfg(feature = "python")]
+#[rstest]
+#[case(false, true, false)]
+#[case(true, true, false)]
+#[case(true, false, false)]
+#[case(true, true, true)]
+fn test_historical_admission_actual_python_requester_engine_response_route(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] resolved: bool,
+    #[case] override_hook: bool,
+    #[case] canceled: bool,
+) {
+    use nautilus_common::python::actor::{PyDataActor, PyDataActorInner};
+    use pyo3::{
+        ffi::c_str,
+        prelude::*,
+        types::{PyDict, PyList, PyModule},
+    };
+
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            request,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    if !resolved {
+        engine.deregister_client(&client_id);
+    }
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "actual_history_admission").unwrap();
+        module.add_class::<PyDataActor>().unwrap();
+        py.run(
+            c_str!(
+                r#"
+class LegacyReceiver(DataActor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures = []
+        self.raw = []
+    def on_historical_bars(self, bars: list[object]) -> None:
+        self.raw.append(bars)
+class FailureReceiver(LegacyReceiver):
+    def on_historical_bars_request_failed(self, failure: object) -> None:
+        self.failures.append(failure)
+"#
+            ),
+            Some(&module.dict()),
+            Some(&module.dict()),
+        )
+        .unwrap();
+        let receiver = module
+            .getattr(if override_hook {
+                "FailureReceiver"
+            } else {
+                "LegacyReceiver"
+            })
+            .unwrap()
+            .call0()
+            .unwrap();
+        let wrapper = receiver.extract::<Py<PyDataActor>>().unwrap();
+        let actor_id = ActorId::from("PY-ADMISSION-OWNER").inner();
+        wrapper
+            .borrow_mut(py)
+            .set_actor_id(ActorId::from("PY-ADMISSION-OWNER"));
+        wrapper
+            .borrow_mut(py)
+            .register(TraderId::test_default(), clock, cache.clone())
+            .unwrap();
+        wrapper.borrow(py).register_in_global_registries().unwrap();
+        // Native Trader/LiveNode drives the registered inner component, without borrowing Py self
+        get_actor_unchecked::<PyDataActorInner>(&actor_id)
+            .start()
+            .unwrap();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("limit", 7).unwrap();
+        kwargs.set_item("client_id", request.client_id).unwrap();
+        let params = PyDict::new(py);
+        params
+            .set_item(
+                "bar_types",
+                vec![format!(
+                    "{}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+                    request.bar_type.instrument_id()
+                )],
+            )
+            .unwrap();
+        kwargs.set_item("params", params).unwrap();
+        let request_id = receiver
+            .call_method("request_bars", (request.bar_type,), Some(&kwargs))
+            .unwrap()
+            .extract::<String>()
+            .unwrap()
+            .parse::<UUID4>()
+            .unwrap();
+
+        if canceled {
+            get_actor_unchecked::<PyDataActorInner>(&actor_id)
+                .stop()
+                .unwrap();
+        }
+        let DataCommand::Request(command) = queued.borrow_mut().remove(0) else {
+            panic!("Python requester must use the actual Native command route");
+        };
+        assert!(engine.execute_request(command).is_err());
+        let failures = receiver
+            .getattr("failures")
+            .unwrap()
+            .cast_into::<PyList>()
+            .unwrap();
+        assert_eq!(failures.len(), usize::from(override_hook && !canceled));
+        assert!(
+            receiver
+                .getattr("raw")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&request_id)
+                .is_none()
+        );
+
+        if override_hook && !canceled {
+            let failure = failures.get_item(0).unwrap();
+            assert_eq!(
+                failure
+                    .getattr("correlation_id")
+                    .unwrap()
+                    .extract::<UUID4>()
+                    .unwrap(),
+                request_id
+            );
+            assert_eq!(
+                failure
+                    .getattr("client_id")
+                    .unwrap()
+                    .extract::<Option<ClientId>>()
+                    .unwrap(),
+                resolved.then_some(client_id)
+            );
+            assert_eq!(
+                failure
+                    .getattr("requested_client_id")
+                    .unwrap()
+                    .extract::<Option<ClientId>>()
+                    .unwrap(),
+                request.client_id
+            );
+            assert!(failure.getattr("start").unwrap().is_none());
+            assert!(failure.getattr("end").unwrap().is_none());
+            assert_eq!(
+                failure
+                    .call_method0("aggregate_bar_types")
+                    .unwrap()
+                    .extract::<Vec<BarType>>()
+                    .unwrap(),
+                vec![target]
+            );
+            assert!(
+                !failure
+                    .getattr("error")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap()
+                    .is_empty()
+            );
+            failure
+                .call_method0("params")
+                .unwrap()
+                .call_method0("clear")
+                .unwrap();
+            assert!(
+                !failure
+                    .call_method0("params")
+                    .unwrap()
+                    .cast_into::<PyDict>()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        if canceled {
+            for command in queued.borrow_mut().drain(..) {
+                engine.execute(command);
+            }
+        } else {
+            get_actor_unchecked::<PyDataActorInner>(&actor_id)
+                .stop()
+                .unwrap();
+            assert!(
+                queued.borrow().is_empty(),
+                "Failure delivery must retire original pending ID"
+            );
+        }
+    });
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+fn assert_historical_target_output(response: &BarsResponse, target: BarType, volume: u64) {
+    let batches = validated_historical_batches(response);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].bar_type, target);
+    assert_eq!(batches[0].data.len(), 1);
+    assert_eq!(batches[0].data[0].bar_type, target);
+    assert_eq!(batches[0].data[0].volume, Quantity::from(volume));
+}
+
+struct HistoricalTargetIndicator {
+    bars: Rc<RefCell<Vec<Bar>>>,
+    fail: bool,
+}
+
+impl ActorIndicator for HistoricalTargetIndicator {
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn initialized(&self) -> anyhow::Result<bool> {
+        Ok(!self.bars.borrow().is_empty())
+    }
+    fn handle_quote(&self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn handle_trade(&self, _trade: &TradeTick) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn handle_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        self.bars.borrow_mut().push(*bar);
+        anyhow::ensure!(!self.fail, "Indicator failure");
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_outcome_native_actor_delivers_original_context_after_target_indicators(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] fault: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let actor_id = historical_source_actor(cache, "TYPED-HISTORY");
+    let indicators = Rc::new(RefCell::new(Vec::new()));
+    let request_id = {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+        actor.start().unwrap();
+        actor.core.register_indicator_for_bars(
+            target,
+            Rc::new(HistoricalTargetIndicator {
+                bars: indicators.clone(),
+                fail: false,
+            }),
+        );
+        actor.observed_indicators = Some(indicators.clone());
+        actor
+            .request_bars(
+                request.bar_type,
+                request.start,
+                request.end,
+                request.limit,
+                request.client_id,
+                request.params,
+            )
+            .unwrap()
+    };
+    response.correlation_id = request_id;
+    engine.execute(queued.borrow_mut().remove(0));
+    if fault {
+        response.data.remove(3);
+    }
+    engine.response(DataResponse::Bars(response.clone()));
+    let actor = get_actor_unchecked::<HistoricalSourceActor>(&actor_id);
+    assert_eq!(actor.responses.len(), 1);
+    assert_eq!(actor.responses[0].correlation_id, request_id);
+    assert_eq!(actor.responses[0].bar_type, request.bar_type);
+
+    if fault {
+        assert!(matches!(
+            actor.responses[0].historical_outcome,
+            Some(HistoricalBarsOutcome::Failed { .. })
+        ));
+        assert_eq!(actor.callback_indicator_counts, vec![0]);
+        assert!(indicators.borrow().is_empty());
+        assert!(actor.received.is_empty());
+    } else {
+        assert_eq!(actor.callback_indicator_counts, vec![1]);
+        assert_eq!(
+            &*indicators.borrow(),
+            &validated_historical_batches(&actor.responses[0])[0].data
+        );
+        assert_eq!(actor.received, response.data);
+    }
+}
+
+#[rstest]
+#[case::source_indicator(0)]
+#[case::target_indicator(1)]
+#[case::validated_hook(2)]
+#[case::rejected_hook(3)]
+#[case::admission_hook(4)]
+fn test_historical_delivery_error_retires_requester_before_hooks_and_preserves_sibling(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] stage: u8,
+    #[values(false, true)] fail_lifecycle: bool,
+    #[values(false, true)] ready: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let owner = historical_source_actor(cache.clone(), "DELIVERY-OWNER");
+    let sibling = historical_source_actor(cache.clone(), "DELIVERY-SIBLING");
+    let indicators = Rc::new(RefCell::new(Vec::new()));
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&owner);
+        if !ready {
+            actor.start().unwrap();
+        }
+        actor.fail_lifecycle = fail_lifecycle;
+        actor.fail_history_hook = matches!(stage, 2..=4);
+        for (bar_type, fail) in [(request.bar_type, stage == 0), (target, stage == 1)] {
+            actor.core.register_indicator_for_bars(
+                bar_type,
+                Rc::new(HistoricalTargetIndicator {
+                    bars: indicators.clone(),
+                    fail,
+                }),
+            );
+        }
+        actor.subscribe_bars(request.bar_type, request.client_id, None);
+    }
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&sibling);
+        actor.start().unwrap();
+        actor.subscribe_bars(request.bar_type, request.client_id, None);
+    }
+
+    for command in std::mem::take(&mut *queued.borrow_mut()) {
+        engine.execute(command);
+    }
+    let mut first = request.clone();
+    if stage == 4 {
+        first.limit = None;
+    }
+    let first_id = historical_source_actor_request(&owner, &first);
+    let pending_id = historical_source_actor_request(&owner, &request);
+    let sibling_id = historical_source_actor_request(&sibling, &request);
+    get_actor_unchecked::<HistoricalSourceActor>(&owner).lifecycle_handler_ids =
+        vec![first_id, pending_id, sibling_id];
+    let commands = std::mem::take(&mut *queued.borrow_mut());
+    assert_eq!(commands.len(), 3);
+    // Admit the independent and still-pending requests before the first request can fail inline
+    engine.execute(commands[1].clone());
+    engine.execute(commands[2].clone());
+    let DataCommand::Request(command) = commands[0].clone() else {
+        panic!("Requester must use Native's request route");
+    };
+
+    if stage == 4 {
+        assert!(engine.execute_request(command).is_err());
+    } else {
+        engine.execute_request(command).unwrap();
+        let mut first_response = response.clone();
+        first_response.correlation_id = first_id;
+        if stage == 3 {
+            first_response.data.remove(3);
+        }
+        engine.response(DataResponse::Bars(first_response));
+    }
+    let expected_state = match (ready, fail_lifecycle) {
+        (false, false) | (true, true) => ComponentState::Faulted,
+        (false, true) => ComponentState::Faulting,
+        (true, false) => ComponentState::Disposed,
+    };
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&owner);
+        assert_eq!(actor.state(), expected_state);
+        assert_eq!(actor.fault_count, usize::from(!ready));
+        assert_eq!(actor.dispose_count, usize::from(ready));
+        assert_eq!(
+            actor.lifecycle_states,
+            vec![if ready {
+                ComponentState::Disposing
+            } else {
+                ComponentState::Faulting
+            }]
+        );
+        assert_eq!(actor.lifecycle_handler_presence, vec![false, false, true]);
+        assert_eq!(actor.responses.len(), usize::from(matches!(stage, 2 | 3)));
+        assert_eq!(actor.failures.len(), usize::from(stage == 4));
+        if stage == 2 {
+            assert!(matches!(
+                actor.responses[0].historical_outcome,
+                Some(HistoricalBarsOutcome::Validated { .. })
+            ));
+            assert_eq!(actor.received, response.data);
+        } else if stage == 3 {
+            assert!(matches!(
+                actor.responses[0].historical_outcome,
+                Some(HistoricalBarsOutcome::Failed { .. })
+            ));
+        }
+        assert!(actor.start().is_err());
+        assert!(
+            actor
+                .request_bars(
+                    request.bar_type,
+                    request.start,
+                    request.end,
+                    request.limit,
+                    request.client_id,
+                    request.params.clone(),
+                )
+                .is_err()
+        );
+    }
+
+    for id in [first_id, pending_id] {
+        assert!(stub_msgbus.borrow().get_response_handler(&id).is_none());
+    }
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&sibling_id)
+            .is_some()
+    );
+    assert_eq!(
+        cache.borrow().bar_count(&request.bar_type),
+        if stage < 3 { 7 } else { 0 }
+    );
+    assert_eq!(cache.borrow().bar_count(&target), usize::from(stage < 3));
+    assert_eq!(
+        indicators.borrow().len(),
+        match stage {
+            0 => 1,
+            1 | 2 => 8,
+            3 | 4 => 0,
+            _ => panic!("Unknown delivery error stage"),
+        }
+    );
+    let source_snapshot = cache.borrow().bars(&request.bar_type);
+    let target_snapshot = cache.borrow().bars(&target);
+    let indicator_snapshot = indicators.borrow().clone();
+    let mut late = response.clone();
+    late.data[0].close = Price::from("0.65600");
+    for id in [first_id, pending_id] {
+        late.correlation_id = id;
+        engine.response(DataResponse::Bars(late.clone()));
+    }
+
+    for command in std::mem::take(&mut *queued.borrow_mut()) {
+        engine.execute(command);
+    }
+    late.correlation_id = pending_id;
+    engine.response(DataResponse::Bars(late));
+    assert_eq!(cache.borrow().bars(&request.bar_type), source_snapshot);
+    assert_eq!(cache.borrow().bars(&target), target_snapshot);
+    assert_eq!(*indicators.borrow(), indicator_snapshot);
+    let mut sibling_response = response.clone();
+    sibling_response.correlation_id = sibling_id;
+    engine.response(DataResponse::Bars(sibling_response));
+    msgbus::publish_bar(
+        switchboard::get_bars_topic(request.bar_type),
+        &response.data[0],
+    );
+    let sibling_actor = get_actor_unchecked::<HistoricalSourceActor>(&sibling);
+    assert!(sibling_actor.is_running());
+    assert_eq!(sibling_actor.received, response.data);
+    assert_eq!(sibling_actor.live_bars, vec![response.data[0]]);
+    assert_eq!(sibling_actor.responses.len(), 1);
+    assert!(matches!(
+        sibling_actor.responses[0].historical_outcome,
+        Some(HistoricalBarsOutcome::Validated { .. })
+    ));
+    assert_eq!(*indicators.borrow(), indicator_snapshot);
+    let owner_actor = get_actor_unchecked::<HistoricalSourceActor>(&owner);
+    assert_eq!(owner_actor.state(), expected_state);
+    assert!(owner_actor.live_bars.is_empty());
+    assert_eq!(owner_actor.fault_count, usize::from(!ready));
+    assert_eq!(owner_actor.dispose_count, usize::from(ready));
+    assert_eq!(
+        owner_actor.responses.len(),
+        usize::from(matches!(stage, 2 | 3))
+    );
+    assert_eq!(owner_actor.failures.len(), usize::from(stage == 4));
+}
+
+#[rstest]
+#[case(true)]
+#[case(false)]
+fn test_historical_delivery_error_default_profile_preserves_legacy_behavior(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] indicator_error: bool,
+) {
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, false);
+    request.params = None;
+    response.params = None;
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let owner = historical_source_actor(cache, "LEGACY-DELIVERY-OWNER");
+    let indicators = Rc::new(RefCell::new(Vec::new()));
+    {
+        let mut actor = get_actor_unchecked::<HistoricalSourceActor>(&owner);
+        actor.start().unwrap();
+        actor.fail_history_hook = !indicator_error;
+        actor.core.register_indicator_for_bars(
+            request.bar_type,
+            Rc::new(HistoricalTargetIndicator {
+                bars: indicators.clone(),
+                fail: indicator_error,
+            }),
+        );
+    }
+    let first_id = historical_source_actor_request(&owner, &request);
+    engine.execute(queued.borrow_mut().remove(0));
+    response.correlation_id = first_id;
+    engine.response(DataResponse::Bars(response.clone()));
+    let pending_id = historical_source_actor_request(&owner, &request);
+    let actor = get_actor_unchecked::<HistoricalSourceActor>(&owner);
+    assert!(actor.is_running());
+    assert_eq!(actor.fault_count, 0);
+    assert_eq!(actor.dispose_count, 0);
+    assert!(actor.responses.is_empty());
+    assert!(actor.failures.is_empty());
+    assert_eq!(
+        actor.received,
+        if indicator_error {
+            Vec::new()
+        } else {
+            response.data
+        }
+    );
+    assert_eq!(
+        indicators.borrow().len(),
+        if indicator_error { 1 } else { 7 }
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&first_id)
+            .is_none()
+    );
+    assert!(
+        stub_msgbus
+            .borrow()
+            .get_response_handler(&pending_id)
+            .is_some()
+    );
+}
+
+#[cfg(feature = "python")]
+#[rstest]
+#[case::source_indicator(0)]
+#[case::target_indicator(1)]
+#[case::validated_hook(2)]
+#[case::rejected_hook(3)]
+#[case::admission_hook(4)]
+fn test_historical_delivery_error_actual_python_requester(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] stage: u8,
+    #[values(false, true)] fail_lifecycle: bool,
+    #[values(false, true)] ready: bool,
+) {
+    use nautilus_common::python::actor::{PyDataActor, PyDataActorInner};
+    use pyo3::{
+        ffi::c_str,
+        prelude::*,
+        types::{PyDict, PyList, PyModule},
+    };
+
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            request,
+            response,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    let queued = Rc::new(RefCell::new(Vec::new()));
+    let queued_clone = queued.clone();
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: DataCommand| queued_clone.borrow_mut().push(command)),
+    );
+    let sibling = historical_source_actor(cache.clone(), "PY-DELIVERY-SIBLING");
+    get_actor_unchecked::<HistoricalSourceActor>(&sibling)
+        .start()
+        .unwrap();
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "actual_history_delivery_failure").unwrap();
+        module.add_class::<PyDataActor>().unwrap();
+        py.run(
+            c_str!(
+                r#"
+class BarIndicator:
+    initialized = True
+    def __init__(self, fail: bool) -> None:
+        self.fail = fail
+        self.bars = []
+    def handle_bar(self, bar: object) -> None:
+        self.bars.append(bar)
+        if self.fail:
+            raise RuntimeError("Python indicator failure")
+class Receiver(DataActor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stage = 0
+        self.fail_lifecycle = False
+        self.responses = []
+        self.failures = []
+        self.raw = []
+        self.live = []
+        self.faults = 0
+        self.disposals = 0
+    def on_historical_bars(self, bars: list[object]) -> None:
+        self.raw.append(bars)
+    def on_historical_bars_response(self, response: object) -> None:
+        self.responses.append(response)
+        if self.stage in (2, 3):
+            raise RuntimeError("Python response hook failure")
+    def on_historical_bars_request_failed(self, failure: object) -> None:
+        self.failures.append(failure)
+        raise RuntimeError("Python admission hook failure")
+    def on_bar(self, bar: object) -> None:
+        self.live.append(bar)
+    def on_fault(self) -> None:
+        self.faults += 1
+
+        if self.fail_lifecycle:
+            raise RuntimeError("Python fault hook failure")
+    def on_dispose(self) -> None:
+        self.disposals += 1
+
+        if self.fail_lifecycle:
+            raise RuntimeError("Python disposal hook failure")
+"#
+            ),
+            Some(&module.dict()),
+            Some(&module.dict()),
+        )
+        .unwrap();
+        let receiver = module.getattr("Receiver").unwrap().call0().unwrap();
+        receiver.setattr("stage", stage).unwrap();
+        receiver.setattr("fail_lifecycle", fail_lifecycle).unwrap();
+        let wrapper = receiver.extract::<Py<PyDataActor>>().unwrap();
+        let actor_id = ActorId::from("PY-DELIVERY-OWNER").inner();
+        wrapper
+            .borrow_mut(py)
+            .set_actor_id(ActorId::from("PY-DELIVERY-OWNER"));
+        wrapper
+            .borrow_mut(py)
+            .register(TraderId::test_default(), clock, cache.clone())
+            .unwrap();
+        wrapper.borrow(py).register_in_global_registries().unwrap();
+
+        if !ready {
+            get_actor_unchecked::<PyDataActorInner>(&actor_id)
+                .start()
+                .unwrap();
+        }
+        let source_indicator = module
+            .getattr("BarIndicator")
+            .unwrap()
+            .call1((stage == 0,))
+            .unwrap();
+        let target_indicator = module
+            .getattr("BarIndicator")
+            .unwrap()
+            .call1((stage == 1,))
+            .unwrap();
+        receiver
+            .call_method1(
+                "register_indicator_for_bars",
+                (request.bar_type, &source_indicator),
+            )
+            .unwrap();
+        receiver
+            .call_method1("register_indicator_for_bars", (target, &target_indicator))
+            .unwrap();
+        receiver
+            .call_method1("subscribe_bars", (request.bar_type,))
+            .unwrap();
+        let subscription_commands = std::mem::take(&mut *queued.borrow_mut());
+        for command in subscription_commands {
+            engine.execute(command);
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("start", request.start).unwrap();
+        kwargs.set_item("end", request.end).unwrap();
+        kwargs.set_item("client_id", request.client_id).unwrap();
+        let params = PyDict::new(py);
+        params
+            .set_item(
+                "bar_types",
+                request.params.as_ref().unwrap()["bar_types"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        params.set_item("skip_first_non_full_bar", true).unwrap();
+        params
+            .set_item("disable_build_with_no_updates", true)
+            .unwrap();
+        params.set_item("update_subscriptions", false).unwrap();
+        kwargs.set_item("params", params).unwrap();
+        if stage != 4 {
+            kwargs.set_item("limit", 7).unwrap();
+        }
+        let first_id = receiver
+            .call_method("request_bars", (request.bar_type,), Some(&kwargs))
+            .unwrap()
+            .extract::<String>()
+            .unwrap()
+            .parse::<UUID4>()
+            .unwrap();
+        kwargs.set_item("limit", 7).unwrap();
+        let pending_id = receiver
+            .call_method("request_bars", (request.bar_type,), Some(&kwargs))
+            .unwrap()
+            .extract::<String>()
+            .unwrap()
+            .parse::<UUID4>()
+            .unwrap();
+        let sibling_id = historical_source_actor_request(&sibling, &request);
+        let commands = std::mem::take(&mut *queued.borrow_mut());
+        assert_eq!(commands.len(), 3);
+        engine.execute(commands[1].clone());
+        engine.execute(commands[2].clone());
+        let DataCommand::Request(command) = commands[0].clone() else {
+            panic!("Python requester must use Native's request route");
+        };
+
+        if stage == 4 {
+            assert!(engine.execute_request(command).is_err());
+        } else {
+            engine.execute_request(command).unwrap();
+            let mut first_response = response.clone();
+            first_response.correlation_id = first_id;
+            if stage == 3 {
+                first_response.data.remove(3);
+            }
+            engine.response(DataResponse::Bars(first_response));
+        }
+        let expected_state = match (ready, fail_lifecycle) {
+            (false, false) | (true, true) => ComponentState::Faulted,
+            (false, true) => ComponentState::Faulting,
+            (true, false) => ComponentState::Disposed,
+        };
+        assert_eq!(
+            get_actor_unchecked::<PyDataActorInner>(&actor_id).state(),
+            expected_state
+        );
+        assert_eq!(
+            receiver
+                .getattr("faults")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            usize::from(!ready)
+        );
+        assert_eq!(
+            receiver
+                .getattr("disposals")
+                .unwrap()
+                .extract::<usize>()
+                .unwrap(),
+            usize::from(ready)
+        );
+        assert!(
+            receiver
+                .call_method("request_bars", (request.bar_type,), Some(&kwargs))
+                .is_err()
+        );
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&first_id)
+                .is_none()
+        );
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&pending_id)
+                .is_none()
+        );
+        assert!(
+            stub_msgbus
+                .borrow()
+                .get_response_handler(&sibling_id)
+                .is_some()
+        );
+        let source_snapshot = cache.borrow().bars(&request.bar_type);
+        let target_snapshot = cache.borrow().bars(&target);
+        let mut late = response.clone();
+        late.data[0].close = Price::from("0.65600");
+        for id in [first_id, pending_id] {
+            late.correlation_id = id;
+            engine.response(DataResponse::Bars(late.clone()));
+        }
+        let cancellation_commands = std::mem::take(&mut *queued.borrow_mut());
+        for command in cancellation_commands {
+            engine.execute(command);
+        }
+        msgbus::publish_bar(
+            switchboard::get_bars_topic(request.bar_type),
+            &response.data[0],
+        );
+        assert_eq!(cache.borrow().bars(&request.bar_type), source_snapshot);
+        assert_eq!(cache.borrow().bars(&target), target_snapshot);
+        let source_bars = source_indicator
+            .getattr("bars")
+            .unwrap()
+            .cast_into::<PyList>()
+            .unwrap();
+        let target_bars = target_indicator
+            .getattr("bars")
+            .unwrap()
+            .cast_into::<PyList>()
+            .unwrap();
+        assert_eq!(
+            source_bars.len(),
+            match stage {
+                0 => 1,
+                1 | 2 => 7,
+                3 | 4 => 0,
+                _ => panic!("Unknown Python delivery error stage"),
+            }
+        );
+        assert_eq!(target_bars.len(), usize::from(matches!(stage, 1 | 2)));
+        let responses = receiver
+            .getattr("responses")
+            .unwrap()
+            .cast_into::<PyList>()
+            .unwrap();
+        let failures = receiver
+            .getattr("failures")
+            .unwrap()
+            .cast_into::<PyList>()
+            .unwrap();
+        assert_eq!(responses.len(), usize::from(matches!(stage, 2 | 3)));
+        assert_eq!(failures.len(), usize::from(stage == 4));
+        if stage == 2 || stage == 3 {
+            let view = responses.get_item(0).unwrap();
+            assert_eq!(
+                view.getattr("correlation_id")
+                    .unwrap()
+                    .extract::<UUID4>()
+                    .unwrap(),
+                first_id
+            );
+            assert_eq!(
+                view.getattr("historical_outcome")
+                    .unwrap()
+                    .getattr("is_validated")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                stage == 2
+            );
+        } else if stage == 4 {
+            assert_eq!(
+                failures
+                    .get_item(0)
+                    .unwrap()
+                    .getattr("correlation_id")
+                    .unwrap()
+                    .extract::<UUID4>()
+                    .unwrap(),
+                first_id
+            );
+        }
+        assert!(
+            receiver
+                .getattr("raw")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            receiver
+                .getattr("live")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap()
+                .is_empty()
+        );
+        let mut sibling_response = response.clone();
+        sibling_response.correlation_id = sibling_id;
+        engine.response(DataResponse::Bars(sibling_response));
+        let sibling_actor = get_actor_unchecked::<HistoricalSourceActor>(&sibling);
+        assert!(sibling_actor.is_running());
+        assert_eq!(sibling_actor.received, response.data);
+        assert!(matches!(
+            sibling_actor.responses[0].historical_outcome,
+            Some(HistoricalBarsOutcome::Validated { .. })
+        ));
+    });
+}
+
+#[rstest]
+fn test_historical_outcome_default_profile_ignores_forged_targets_and_serializes_legacy_shape(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, false);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request))
+        .unwrap();
+    let mut forged = response.data[0];
+    forged.bar_type = target;
+    forged.volume = Quantity::from(10_000);
+    response.historical_outcome = Some(HistoricalBarsOutcome::Validated {
+        aggregates: vec![HistoricalBarsBatch {
+            bar_type: target,
+            data: vec![forged],
+        }],
+    });
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        cache.borrow().bar(&target).unwrap().volume,
+        Quantity::from(500)
+    );
+    let replies = saver.get_messages();
+    assert!(replies[0].historical_outcome.is_none());
+    let json = serde_json::to_value(&replies[0]).unwrap();
+    assert!(json.get("historical_outcome").is_none());
+    let restored: BarsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.data, replies[0].data);
+    assert!(restored.historical_outcome.is_none());
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_outcome_unreachable_target_plan_fails_under_original_context(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] cyclic: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let suffix = if cyclic { "INTERNAL" } else { "EXTERNAL" };
+    let invalid = BarType::from(
+        format!(
+            "{}-5-MINUTE-LAST-INTERNAL@5-MINUTE-{suffix}",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("bar_types".to_string(), json!([invalid.to_string()]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    assert!(
+        engine
+            .execute_request(RequestCommand::Bars(request.clone()))
+            .is_err()
+    );
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    let Some(HistoricalBarsOutcome::Failed {
+        error,
+        aggregate_bar_types,
+    }) = &replies[0].historical_outcome
+    else {
+        panic!("Invalid original target plan must fail explicitly");
+    };
+    assert!(!error.is_empty());
+    assert_eq!(aggregate_bar_types, &vec![invalid.standard()]);
+    assert!(replies[0].data.is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_outcome_failure_does_not_disturb_unrelated_live_aggregator(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] invalid_source: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let live_target = BarType::from(
+        format!(
+            "{}-1-TICK-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("bar_types".to_string(), json!([live_target.to_string()]));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("update_subscriptions".to_string(), json!(true));
+    let (handler, replies) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    let (handler, bars) = get_typed_message_saving_handler::<Bar>(None);
+    msgbus::subscribe_bars(
+        switchboard::get_bars_topic(live_target.standard()).into(),
+        handler,
+        None,
+    );
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            live_target,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            request.ts_init,
+            None,
+            None,
+        )))
+        .unwrap();
+
+    if invalid_source {
+        response.data.remove(3);
+    }
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = replies.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert!(matches!(
+        replies[0].historical_outcome,
+        Some(HistoricalBarsOutcome::Failed { .. })
+    ));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&live_target.standard()), 0);
+    assert!(bars.get_messages().is_empty());
+    let mut live_bar = response.data[0];
+    live_bar.ts_event =
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS + 8 * HISTORICAL_SOURCE_MINUTE_NS - 1_000_000);
+    live_bar.ts_init = live_bar.ts_event;
+    live_bar.volume = Quantity::from(123);
+    engine.process_data(Data::Bar(live_bar));
+    let output = bars.get_messages();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].bar_type, live_target.standard());
+    assert_eq!(output[0].volume, Quantity::from(123));
+    assert_eq!(cache.borrow().bar_count(&live_target.standard()), 1);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_outcome_returns_actual_request_local_targets_for_concurrent_roots(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] update_subscriptions: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    request.params.as_mut().unwrap().insert(
+        "update_subscriptions".to_string(),
+        json!(update_subscriptions),
+    );
+    let mut sibling = request.clone();
+    sibling.request_id = UUID4::new();
+    let (handler, first) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    let (handler, second) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&sibling.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine
+        .execute_request(RequestCommand::Bars(sibling.clone()))
+        .unwrap();
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+
+    let mut sibling_response = response.clone();
+    sibling_response.correlation_id = sibling.request_id;
+    for bar in &mut sibling_response.data {
+        bar.volume = Quantity::from(200);
+    }
+    engine.response(DataResponse::Bars(sibling_response.clone()));
+    assert!(first.get_messages().is_empty());
+    engine.response(DataResponse::Bars(response.clone()));
+
+    for (replies, original, volume) in [
+        (first.get_messages(), request, 500),
+        (second.get_messages(), sibling, 1_000),
+    ] {
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.correlation_id, original.request_id);
+        assert_eq!(reply.client_id, client_id);
+        assert_eq!(reply.bar_type, original.bar_type);
+        assert_eq!(reply.start, original.start.map(UnixNanos::from));
+        assert_eq!(reply.end, original.end.map(UnixNanos::from));
+        assert_eq!(reply.params, original.params);
+        let batches = validated_historical_batches(reply);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].bar_type, target);
+        assert_eq!(batches[0].data.len(), 1);
+        assert_eq!(batches[0].data[0].bar_type, target);
+        assert_eq!(batches[0].data[0].volume, Quantity::from(volume));
+        assert_eq!(
+            batches[0].data[0].ts_event,
+            UnixNanos::from(HISTORICAL_SOURCE_START_NS + 5 * HISTORICAL_SOURCE_MINUTE_NS,)
+        );
+    }
+    engine.response(DataResponse::Bars(response));
+    engine.response(DataResponse::Bars(sibling_response));
+    assert_eq!(first.get_messages().len(), 1);
+    assert_eq!(second.get_messages().len(), 1);
+}
+
+#[rstest]
+fn test_historical_outcome_empty_targets_keep_original_uuid_and_each_target_identity(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let ten = BarType::from(
+        format!(
+            "{}-10-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    let five = BarType::from(
+        format!(
+            "{}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request.params.as_mut().unwrap().insert(
+        "bar_types".to_string(),
+        json!([ten.to_string(), five.to_string()]),
+    );
+    response.data.truncate(3);
+    request.end = Some(response.data[2].ts_event.to_datetime_utc());
+    request.limit = NonZeroUsize::new(3);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    let batches = validated_historical_batches(&replies[0]);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.bar_type)
+            .collect::<Vec<_>>(),
+        vec![ten.standard(), target]
+    );
+    assert!(batches.iter().all(|batch| batch.data.is_empty()));
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert_eq!(cache.borrow().bar_count(&ten.standard()), 0);
+}
+
+#[rstest]
+#[case(0)]
+#[case(1)]
+#[case(2)]
+fn test_historical_outcome_source_failures_are_explicit_without_partial_targets(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] fault: u8,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    match fault {
+        0 => response.data.clear(),
+        1 => {
+            response.data.remove(3);
+        }
+        _ => response.data[3].high = Price::from("0.10000"),
+    }
+    let late = response.clone();
+    engine.response(DataResponse::Bars(response));
+    engine.response(DataResponse::Bars(late));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].client_id, client_id);
+    assert_eq!(replies[0].bar_type, request.bar_type);
+    assert!(replies[0].data.is_empty());
+    let Some(HistoricalBarsOutcome::Failed {
+        error,
+        aggregate_bar_types,
+    }) = &replies[0].historical_outcome
+    else {
+        panic!("Source failure must have an explicit engine-authored outcome");
+    };
+    assert!(!error.is_empty());
+    assert_eq!(aggregate_bar_types, &vec![target]);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+fn test_historical_outcome_ignores_forged_client_outcome_and_target_plan(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    response.params = Some(params_from_json(json!({"bar_types": []})));
+    response.historical_outcome = Some(HistoricalBarsOutcome::Failed {
+        error: "untrusted client metadata".to_string(),
+        aggregate_bar_types: Vec::new(),
+    });
+    engine.response(DataResponse::Bars(response));
+    let replies = saver.get_messages();
+    let batches = validated_historical_batches(&replies[0]);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].bar_type, target);
+    assert_eq!(batches[0].data[0].volume, Quantity::from(500));
+    assert_eq!(replies[0].params, request.params);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_outcome_returns_actual_flat_and_chained_native_aggregates(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] chained: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let instrument_id = request.bar_type.instrument_id();
+    let five =
+        BarType::from(format!("{instrument_id}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str());
+    let ten = if chained {
+        BarType::from(format!("{instrument_id}-10-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str())
+    } else {
+        BarType::from(format!("{instrument_id}-10-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str())
+    };
+    request.params.as_mut().unwrap().insert(
+        "bar_types".to_string(),
+        json!([ten.to_string(), five.to_string()]),
+    );
+    response.data = (0..17)
+        .map(|index| {
+            make_bar(
+                request.bar_type,
+                "0.65000",
+                "0.66000",
+                "0.64000",
+                "0.65500",
+                100,
+                HISTORICAL_SOURCE_START_NS - 5 * HISTORICAL_SOURCE_MINUTE_NS
+                    + index * HISTORICAL_SOURCE_MINUTE_NS
+                    - 1_000_000,
+            )
+        })
+        .collect();
+    request.start = Some(response.data[0].ts_event.to_datetime_utc());
+    request.end = Some(response.data[16].ts_event.to_datetime_utc());
+    request.limit = NonZeroUsize::new(17);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    let batches = validated_historical_batches(&replies[0]);
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].bar_type, ten.standard());
+    assert_eq!(batches[1].bar_type, target);
+    assert_eq!(batches[0].data.len(), 1);
+    assert_eq!(batches[0].data[0].volume, Quantity::from(1_000));
+    assert_eq!(
+        batches[0].data[0].ts_event,
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS + 10 * HISTORICAL_SOURCE_MINUTE_NS,)
+    );
+    assert_eq!(batches[1].data.len(), 3);
+    for (index, bar) in batches[1].data.iter().enumerate() {
+        assert_eq!(bar.bar_type, target);
+        assert_eq!(bar.volume, Quantity::from(500));
+        assert_eq!(
+            bar.ts_event,
+            UnixNanos::from(
+                HISTORICAL_SOURCE_START_NS + index as u64 * 5 * HISTORICAL_SOURCE_MINUTE_NS,
+            )
+        );
+    }
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 17);
+    assert_eq!(cache.borrow().bar_count(&target), 3);
+    assert_eq!(cache.borrow().bar_count(&ten.standard()), 1);
+    let json = serde_json::to_value(&replies[0]).unwrap();
+    let restored: BarsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.historical_outcome, replies[0].historical_outcome);
+    assert_eq!(restored.data, replies[0].data);
+}
+
+#[rstest]
+#[case(false, false, 0)]
+#[case(false, false, 1_000)]
+#[case(false, true, 0)]
+#[case(false, true, 1_000)]
+#[case(true, false, 0)]
+#[case(true, false, 1_000)]
+#[case(true, true, 0)]
+#[case(true, true, 1_000)]
+fn test_historical_outcome_receipt_time_does_not_move_native_event_windows(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] update_subscriptions: bool,
+    #[case] chained: bool,
+    #[case] receipt_step_ns: u64,
+) {
+    let _ = stub_msgbus;
+    let (fixture, clock) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        target,
+        ..
+    } = fixture;
+    let receipt_ns = HISTORICAL_SOURCE_START_NS + 20 * HISTORICAL_SOURCE_MINUTE_NS;
+    clock.borrow_mut().set_time(UnixNanos::from(receipt_ns));
+    let instrument_id = request.bar_type.instrument_id();
+    let five =
+        BarType::from(format!("{instrument_id}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str());
+    let ten = if chained {
+        BarType::from(format!("{instrument_id}-10-MINUTE-LAST-INTERNAL@5-MINUTE-INTERNAL").as_str())
+    } else {
+        BarType::from(format!("{instrument_id}-10-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL").as_str())
+    };
+    let params = request.params.as_mut().unwrap();
+    params.insert(
+        "bar_types".to_string(),
+        json!([ten.to_string(), five.to_string()]),
+    );
+    params.insert(
+        "update_subscriptions".to_string(),
+        json!(update_subscriptions),
+    );
+    response.data = (0..17)
+        .map(|index| {
+            let mut bar = make_bar(
+                request.bar_type,
+                "0.65000",
+                "0.66000",
+                "0.64000",
+                "0.65500",
+                100,
+                HISTORICAL_SOURCE_START_NS - 5 * HISTORICAL_SOURCE_MINUTE_NS
+                    + index * HISTORICAL_SOURCE_MINUTE_NS
+                    - 1_000_000,
+            );
+            bar.ts_init = UnixNanos::from(receipt_ns + index * receipt_step_ns);
+            bar
+        })
+        .collect();
+    request.start = Some(response.data[0].ts_event.to_datetime_utc());
+    request.end = Some(response.data[16].ts_event.to_datetime_utc());
+    request.limit = NonZeroUsize::new(17);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    let batches = validated_historical_batches(&replies[0]);
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].bar_type, ten.standard());
+    assert_eq!(batches[0].data.len(), 1);
+    assert_eq!(batches[0].data[0].volume, Quantity::from(1_000));
+    assert_eq!(
+        batches[0].data[0].ts_event,
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS + 10 * HISTORICAL_SOURCE_MINUTE_NS),
+    );
+    assert_eq!(batches[1].bar_type, target);
+    assert_eq!(batches[1].data.len(), 3);
+    for (index, bar) in batches[1].data.iter().enumerate() {
+        assert_eq!(bar.volume, Quantity::from(500));
+        assert_eq!(bar.open, response.data[0].open);
+        assert_eq!(bar.high, response.data[0].high);
+        assert_eq!(bar.low, response.data[0].low);
+        assert_eq!(bar.close, response.data[0].close);
+        assert_eq!(
+            bar.ts_event,
+            UnixNanos::from(
+                HISTORICAL_SOURCE_START_NS + index as u64 * 5 * HISTORICAL_SOURCE_MINUTE_NS,
+            ),
+        );
+    }
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 17);
+    assert_eq!(cache.borrow().bar_count(&target), 3);
+    assert_eq!(cache.borrow().bar_count(&ten.standard()), 1);
+    for (index, bar) in response.data.iter().rev().enumerate() {
+        assert_eq!(
+            cache.borrow().bar_at_index(&request.bar_type, index),
+            Some(bar),
+        );
+    }
+}
+
+#[rstest]
+fn test_historical_outcome_raw_only_source_still_returns_explicit_original_success(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    request.params = None;
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    assert!(validated_historical_batches(&replies[0]).is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+}
+
+#[rstest]
+fn test_historical_outcome_subscription_handoff_after_fresh_roots_emits_actual_live_time_bar(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let (
+        HistoricalSourceFixture {
+            mut engine,
+            cache,
+            mut request,
+            response,
+            target,
+            ..
+        },
+        clock,
+    ) = historical_source_engine_with_clock(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("update_subscriptions".to_string(), json!(true));
+
+    for index in 0..2 {
+        request.request_id = UUID4::new();
+        let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+        msgbus::register_response_handler(&request.request_id, handler);
+        engine
+            .execute_request(RequestCommand::Bars(request.clone()))
+            .unwrap();
+        let mut root = response.clone();
+        root.correlation_id = request.request_id;
+        engine.response(DataResponse::Bars(root));
+        let replies = saver.get_messages();
+        assert_eq!(replies.len(), 1);
+        assert_historical_target_output(&replies[0], target, 500);
+        assert_eq!(cache.borrow().bar_count(&target), index + 1);
+    }
+    let composite = BarType::from(
+        format!(
+            "{}-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    let (handler, saver) = get_typed_message_saving_handler::<Bar>(None);
+    msgbus::subscribe_bars(switchboard::get_bars_topic(target).into(), handler, None);
+    engine
+        .execute_subscribe(SubscribeCommand::Bars(SubscribeBars::new(
+            composite,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            request.ts_init,
+            None,
+            None,
+        )))
+        .unwrap();
+
+    for minute in 6..10 {
+        let close_ns =
+            HISTORICAL_SOURCE_START_NS + (minute + 1) * HISTORICAL_SOURCE_MINUTE_NS - 1_000_000;
+        engine.process_data(Data::Bar(make_bar(
+            request.bar_type,
+            "0.65000",
+            "0.66000",
+            "0.64000",
+            "0.65500",
+            100,
+            close_ns,
+        )));
+        let boundary = close_ns + 1_000_000;
+        let events = clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(boundary), true);
+        let handlers = clock.borrow().match_handlers(events);
+        for handler in handlers {
+            handler.callback.call(handler.event);
+        }
+    }
+    let live = saver.get_messages();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].bar_type, target);
+    assert_eq!(live[0].volume, Quantity::from(500));
+    assert_eq!(
+        live[0].ts_event,
+        UnixNanos::from(HISTORICAL_SOURCE_START_NS + 10 * HISTORICAL_SOURCE_MINUTE_NS)
+    );
+    // Independent original requests retain Native's configured cache behavior, each caches its
+    // own same-time historical result; the live timer then adds one new bar.
+    assert_eq!(cache.borrow().bar_count(&target), 3);
+}
+
+#[rstest]
+fn test_historical_outcome_native_output_bound_failure_has_no_raw_or_target_cache_effect(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let too_many = BarType::from(
+        format!(
+            "{}-10-VOLUME-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("bar_types".to_string(), json!([too_many.to_string()]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    let Some(HistoricalBarsOutcome::Failed {
+        error,
+        aggregate_bar_types,
+    }) = &replies[0].historical_outcome
+    else {
+        panic!("Native output overflow must fail explicitly");
+    };
+    assert!(error.contains("original source count bound"));
+    assert_eq!(aggregate_bar_types, &vec![too_many.standard()]);
+    assert!(replies[0].data.is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&too_many.standard()), 0);
+}
+
+#[rstest]
+fn test_historical_outcome_finer_time_target_is_rejected_before_native_empty_window_panic(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let invalid = BarType::from(
+        format!(
+            "{}-1-SECOND-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("bar_types".to_string(), json!([invalid.to_string()]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    assert!(
+        engine
+            .execute_request(RequestCommand::Bars(request.clone()))
+            .is_err()
+    );
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    let Some(HistoricalBarsOutcome::Failed {
+        error,
+        aggregate_bar_types,
+    }) = &replies[0].historical_outcome
+    else {
+        panic!("Unrepresentable finer history must fail explicitly");
+    };
+    assert!(error.contains("finer than the original 1m source"));
+    assert_eq!(aggregate_bar_types, &vec![invalid.standard()]);
+    assert!(replies[0].data.is_empty());
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&invalid.standard()), 0);
+}
+
+#[rstest]
+fn test_historical_outcome_valid_native_volume_output_uses_original_limit_not_echoed_bound(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        mut response,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let target = BarType::from(
+        format!(
+            "{}-10-VOLUME-LAST-INTERNAL@1-MINUTE-EXTERNAL",
+            request.bar_type.instrument_id(),
+        )
+        .as_str(),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("bar_types".to_string(), json!([target.to_string()]));
+    request.limit = NonZeroUsize::new(70);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    response.params = Some(params_from_json(
+        json!({"data_count": 1, "limit": 1, "bar_types": []}),
+    ));
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    let batches = validated_historical_batches(&replies[0]);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].bar_type, target.standard());
+    assert_eq!(batches[0].data.len(), 70);
+    assert!(
+        batches[0]
+            .data
+            .iter()
+            .all(|bar| bar.volume == Quantity::from(10))
+    );
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+}
+
+#[rstest]
+fn test_historical_source_default_retains_receipt_clock_and_raw_timestamps(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, false);
+
+    for bar in &mut response.data {
+        bar.ts_init =
+            UnixNanos::from(HISTORICAL_SOURCE_START_NS + 20 * HISTORICAL_SOURCE_MINUTE_NS);
+    }
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    assert!(replies[0].historical_outcome.is_none());
+
+    // The opt-in event-clock replay must not change the legacy receipt-clock behavior
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    for (index, bar) in response.data.iter().rev().enumerate() {
+        assert_eq!(
+            cache.borrow().bar_at_index(&request.bar_type, index),
+            Some(bar),
+        );
+    }
+}
+
+#[rstest]
+fn test_historical_source_default_preserves_native_partial_history(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, false);
+    response.data.remove(3);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 6);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        cache.borrow().bar(&target).unwrap().volume,
+        Quantity::from(400)
+    );
+}
+
+#[rstest]
+#[case(0)]
+#[case(3)]
+#[case(6)]
+fn test_historical_source_incomplete_page_has_no_native_cache_or_aggregate_effect(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] missing: usize,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    response.data.remove(missing);
+    response.start = Some(response.data[0].ts_event);
+    response.end = Some(response.data[1].ts_event);
+    response.params = Some(params_from_json(json!({"data_count": response.data.len()})));
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].bar_type, request.bar_type);
+    assert!(replies[0].data.is_empty());
+    assert!(
+        replies[0]
+            .params
+            .as_ref()
+            .unwrap()
+            .contains_key("historical_bar_source_error")
+    );
+}
+
+#[rstest]
+fn test_historical_source_complete_page_ignores_echoed_trimming_and_keeps_rounding_tolerance(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    response.start = Some(response.data[2].ts_event);
+    response.end = Some(response.data[2].ts_event);
+    response.params = Some(params_from_json(json!({"data_count": 1, "bar_types": []})));
+    for bar in &mut response.data {
+        bar.ts_event = UnixNanos::from(bar.ts_event.as_u64() + 128);
+    }
+    let original = response.data.clone();
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        cache.borrow().bar(&target).unwrap().volume,
+        Quantity::from(500)
+    );
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].data, original);
+    assert_eq!(replies[0].params, request.params);
+}
+
+#[rstest]
+#[case(0)]
+#[case(1)]
+#[case(2)]
+#[case(3)]
+#[case(4)]
+fn test_historical_source_wrong_identity_or_bad_tail_has_no_native_effect(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] fault: u8,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        mut response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    match fault {
+        0 => response.client_id = ClientId::from("OTHER"),
+        1 => response.correlation_id = UUID4::new(),
+        2 => response.bar_type = BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"),
+        3 => response.data[6].high = Price::from("0.10000"),
+        _ => response.data[6].ts_event = response.data[5].ts_event,
+    }
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_source_stop_or_reset_rejects_old_request_without_mutating_new_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] reset: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    if reset {
+        engine.reset();
+    } else {
+        engine.stop();
+    }
+    let mut new_request = request.clone();
+    new_request.request_id = UUID4::new();
+    engine
+        .execute_request(RequestCommand::Bars(new_request.clone()))
+        .unwrap();
+    let mut new_response = response.clone();
+    new_response.correlation_id = new_request.request_id;
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    engine.response(DataResponse::Bars(new_response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+}
+
+#[rstest]
+fn test_historical_source_duplicate_response_cannot_update_native_cache_twice(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        ..
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    engine.response(DataResponse::Bars(response.clone()));
+    engine.response(DataResponse::Bars(response));
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+}
+
+#[rstest]
+fn test_historical_source_time_range_must_accept_valid_source_request(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("time_range_generator".to_string(), json!(""));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("durations_seconds".to_string(), json!([60]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    for index in 0..7 {
+        assert_eq!(recorder.borrow().len(), index + 1);
+        let child = recorded_bars_request(&recorder, index);
+        let mut child_response = response.clone();
+        child_response.correlation_id = child.request_id;
+        child_response.data = vec![response.data[index]];
+        child_response.params = Some(params_from_json(json!({"data_count": 0})));
+        engine.response(DataResponse::Bars(child_response));
+
+        if index != 6 {
+            assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+            assert_eq!(cache.borrow().bar_count(&target), 0);
+            assert!(saver.get_messages().is_empty());
+        }
+    }
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        cache.borrow().bar(&target).unwrap().volume,
+        Quantity::from(500)
+    );
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    assert_historical_target_output(&replies[0], target, 500);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn test_historical_source_time_range_bad_or_missing_child_discards_entire_source(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] missing: bool,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("time_range_generator".to_string(), json!(""));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("durations_seconds".to_string(), json!([60]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    for index in 0..4 {
+        let child = recorded_bars_request(&recorder, index);
+        let mut child_response = response.clone();
+        child_response.correlation_id = child.request_id;
+        child_response.data = vec![response.data[index]];
+        if index == 3 {
+            if missing {
+                child_response.data.clear();
+            } else {
+                child_response.data[0].high = Price::from("0.10000");
+            }
+        }
+        engine.response(DataResponse::Bars(child_response));
+        assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+        assert_eq!(cache.borrow().bar_count(&target), 0);
+    }
+    assert_eq!(recorder.borrow().len(), 4);
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert!(replies[0].data.is_empty());
+    assert!(
+        replies[0]
+            .params
+            .as_ref()
+            .unwrap()
+            .contains_key("historical_bar_source_error")
+    );
+}
+
+#[rstest]
+fn test_historical_source_time_range_query_failure_cannot_promote_buffered_source_to_success(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let end_ns = HISTORICAL_SOURCE_START_NS + 6 * HISTORICAL_SOURCE_MINUTE_NS + 30_000_000_000;
+    request.end = Some(UnixNanos::from(end_ns).to_datetime_utc());
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("time_range_generator".to_string(), json!(""));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("durations_seconds".to_string(), json!([60]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+
+    for index in 0..7 {
+        let child = recorded_bars_request(&recorder, index);
+        let mut child_response = response.clone();
+        child_response.correlation_id = child.request_id;
+        child_response.data = vec![response.data[index]];
+        if index == 6 {
+            engine.deregister_client(&client_id);
+        }
+        engine.response(DataResponse::Bars(child_response));
+        assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+        assert_eq!(cache.borrow().bar_count(&target), 0);
+    }
+    assert_eq!(recorder.borrow().len(), 7);
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert!(replies[0].data.is_empty());
+    assert!(
+        replies[0]
+            .params
+            .as_ref()
+            .unwrap()
+            .contains_key("historical_bar_source_error")
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+#[case(0)]
+#[case(1)]
+#[case(2)]
+fn test_historical_source_catalog_client_fanin_validates_whole_original_source(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+    #[case] fault: u8,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let _catalog = register_bar_catalog_with_bars(
+        &mut engine,
+        "strict-source-fanin",
+        &response.data[..4],
+        Some((
+            HISTORICAL_SOURCE_START_NS - HISTORICAL_SOURCE_MINUTE_NS,
+            response.data[3].ts_event.as_u64(),
+        )),
+    );
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    assert_eq!(recorder.borrow().len(), 1);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+    assert_eq!(cache.borrow().bar_count(&target), 0);
+    assert!(saver.get_messages().is_empty());
+    let child = recorded_bars_request(&recorder, 0);
+    let mut child_response = response.clone();
+    child_response.correlation_id = child.request_id;
+    child_response.data = response.data[4..].to_vec();
+    child_response.start = Some(child_response.data[0].ts_event);
+    child_response.end = Some(child_response.data[0].ts_event);
+    child_response.params = Some(params_from_json(json!({"data_count": 1})));
+
+    match fault {
+        1 => {
+            child_response.data.remove(1);
+        }
+        2 => child_response.data[2].high = Price::from("0.10000"),
+        _ => {}
+    }
+    engine.response(DataResponse::Bars(child_response));
+    assert_eq!(engine.request_pipeline_count(), 0);
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    if fault == 0 {
+        assert_eq!(replies[0].data, response.data);
+        assert_historical_target_output(&replies[0], target, 500);
+        assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+        assert_eq!(cache.borrow().bar_count(&target), 1);
+        assert_eq!(
+            cache.borrow().bar(&target).unwrap().volume,
+            Quantity::from(500)
+        );
+    } else {
+        assert!(replies[0].data.is_empty());
+        assert!(matches!(
+            replies[0].historical_outcome,
+            Some(HistoricalBarsOutcome::Failed { .. })
+        ));
+        assert!(
+            replies[0]
+                .params
+                .as_ref()
+                .unwrap()
+                .contains_key("historical_bar_source_error")
+        );
+        assert_eq!(cache.borrow().bar_count(&request.bar_type), 0);
+        assert_eq!(cache.borrow().bar_count(&target), 0);
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_historical_source_time_range_with_catalog_children_returns_complete_root_once(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let HistoricalSourceFixture {
+        mut engine,
+        cache,
+        mut request,
+        response,
+        target,
+        recorder,
+    } = historical_source_engine(audusd_sim, client_id, venue, true);
+    let _catalog = register_bar_catalog_with_bars(
+        &mut engine,
+        "strict-source-time-catalog",
+        &response.data,
+        Some((
+            HISTORICAL_SOURCE_START_NS - HISTORICAL_SOURCE_MINUTE_NS,
+            response.data[6].ts_event.as_u64(),
+        )),
+    );
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("time_range_generator".to_string(), json!(""));
+    request
+        .params
+        .as_mut()
+        .unwrap()
+        .insert("durations_seconds".to_string(), json!([60]));
+    let (handler, saver) = get_any_saving_handler::<BarsResponse>(None);
+    msgbus::register_response_handler(&request.request_id, handler);
+    engine
+        .execute_request(RequestCommand::Bars(request.clone()))
+        .unwrap();
+    assert!(recorder.borrow().is_empty());
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert_eq!(cache.borrow().bar_count(&request.bar_type), 7);
+    assert_eq!(cache.borrow().bar_count(&target), 1);
+    assert_eq!(
+        cache.borrow().bar(&target).unwrap().volume,
+        Quantity::from(500)
+    );
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].correlation_id, request.request_id);
+    assert_eq!(replies[0].data, response.data);
+    assert_historical_target_output(&replies[0], target, 500);
 }
 
 fn add_es_contract(cache: &Rc<RefCell<Cache>>, instrument_id: &str, symbol: &str) -> InstrumentId {

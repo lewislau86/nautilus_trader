@@ -1993,6 +1993,8 @@ pub trait Strategy: DataActor {
     /// any active market exit (or initiate one) before stopping. If `manage_stop`
     /// is disabled, the strategy stops immediately, cleaning up any active market
     /// exit state.
+    /// Pending historical bar requests are invalidated immediately, including when managed exit
+    /// defers the component-stop hook. Live subscriptions and market exit remain available.
     ///
     /// # Returns
     ///
@@ -2002,6 +2004,9 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        StrategyNative::strategy_core_mut(self)
+            .actor
+            .cancel_pending_bar_requests();
         let (manage_stop, is_exiting, should_initiate_exit) = {
             let core = StrategyNative::strategy_core_mut(self);
             let actor_id = core.actor_id();
@@ -2481,6 +2486,7 @@ mod tests {
         clock::{Clock, TestClock},
         component::{Component, deregister_component, register_component_actor},
         enums::ComponentState,
+        messages::data::{DataCommand, RequestCommand},
         msgbus::{
             self, MessagingSwitchboard, TypedHandler, TypedIntoHandler,
             stubs::{
@@ -2492,6 +2498,7 @@ mod tests {
     };
     use nautilus_core::{DurationNanos, UnixNanos};
     use nautilus_model::{
+        data::BarType,
         enums::{
             ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
             PositionAdjustmentType, PositionSide, TriggerType,
@@ -6581,6 +6588,54 @@ mod tests {
         assert!(should_proceed);
         assert!(!strategy.core.is_exiting);
         assert_eq!(strategy.core.market_exit_attempts, 0);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_strategy_stop_invalidates_pending_native_history_before_component_stop(
+        #[case] managed: bool,
+    ) {
+        let mut strategy = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_stop: managed,
+            ..Default::default()
+        });
+        let clock = register_strategy_with_clock(&mut strategy);
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
+        start_strategy(&mut strategy);
+        let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+        msgbus::register_data_command_endpoint(
+            MessagingSwitchboard::data_engine_queue_execute(),
+            handler,
+        );
+        let bar_type = BarType::from("DOGEUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
+        let request_id =
+            DataActor::request_bars(&mut strategy, bar_type, None, None, None, None, None).unwrap();
+        let commands = saver.get_messages();
+        let [DataCommand::Request(RequestCommand::Bars(request))] = commands.as_slice() else {
+            panic!("Expected one Native bar request");
+        };
+        let scope = request.scope.as_ref().unwrap().clone();
+        assert!(scope.is_active());
+        assert_eq!(request.request_id, request_id);
+        let should_proceed = Strategy::stop(&mut strategy);
+        assert_eq!(should_proceed, !managed);
+        // The caller has not invoked Component::stop, including managed-stop deferral.
+        assert_eq!(strategy.core.actor.state(), ComponentState::Running);
+        assert!(!scope.is_active());
+        assert!(
+            msgbus::get_message_bus()
+                .borrow()
+                .get_response_handler(&request_id)
+                .is_none()
+        );
+        assert!(
+            matches!(saver.get_messages().as_slice(), [DataCommand::Request(_), DataCommand::CancelHistoricalBars(id)] if *id == request_id)
+        );
     }
 
     #[rstest]

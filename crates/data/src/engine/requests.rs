@@ -260,6 +260,7 @@ pub(super) fn response_params(resp: &DataResponse) -> Option<&Params> {
         DataResponse::FundingRates(resp) => resp.params.as_ref(),
         DataResponse::OptionChainReferencePrice(resp) => resp.params.as_ref(),
         DataResponse::Bars(resp) => resp.params.as_ref(),
+        DataResponse::BarsRequestFailed(resp) => resp.request.params.as_ref(),
     }
 }
 

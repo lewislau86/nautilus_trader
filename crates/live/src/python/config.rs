@@ -186,7 +186,7 @@ impl LiveDataEngineConfig {
         clippy::needless_pass_by_value,
         reason = "PyO3 #[new] requires owned params"
     )]
-    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None))]
+    #[pyo3(signature = (time_bars_build_with_no_updates=None, time_bars_timestamp_on_close=None, time_bars_skip_first_non_full_bar=None, time_bars_interval_type=None, time_bars_build_delay=None, time_bars_origin_offset=None, validate_data_sequence=None, buffer_deltas=None, emit_quotes_from_book=None, emit_quotes_from_book_depths=None, external_clients=None, debug=None, *, validate_historical_bars=None))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
         time_bars_timestamp_on_close: Option<bool>,
@@ -200,6 +200,7 @@ impl LiveDataEngineConfig {
         emit_quotes_from_book_depths: Option<bool>,
         external_clients: Option<Vec<ClientId>>,
         debug: Option<bool>,
+        validate_historical_bars: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
 
@@ -220,6 +221,8 @@ impl LiveDataEngineConfig {
             time_bars_origin_offset: time_bars_origin_offset.unwrap_or_default(),
             validate_data_sequence: validate_data_sequence
                 .unwrap_or(default.validate_data_sequence),
+            validate_historical_bars: validate_historical_bars
+                .unwrap_or(default.validate_historical_bars),
             buffer_deltas: buffer_deltas.unwrap_or(default.buffer_deltas),
             emit_quotes_from_book: emit_quotes_from_book.unwrap_or(default.emit_quotes_from_book),
             emit_quotes_from_book_depths: emit_quotes_from_book_depths
@@ -270,6 +273,12 @@ impl LiveDataEngineConfig {
     #[pyo3(name = "validate_data_sequence")]
     const fn py_validate_data_sequence(&self) -> bool {
         self.validate_data_sequence
+    }
+
+    #[getter]
+    #[pyo3(name = "validate_historical_bars")]
+    const fn py_validate_historical_bars(&self) -> bool {
+        self.validate_historical_bars
     }
 
     #[getter]
@@ -1391,6 +1400,42 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case(None)]
+    #[case(Some(false))]
+    #[case(Some(true))]
+    fn test_python_history_validation_live_config_explicit_flag(#[case] enabled: Option<bool>) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if let Some(enabled) = enabled {
+                kwargs
+                    .set_item("validate_historical_bars", enabled)
+                    .unwrap();
+            }
+            let config = py
+                .get_type::<LiveDataEngineConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            let expected = enabled.unwrap_or(false);
+            assert_eq!(
+                config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                config
+                    .extract::<LiveDataEngineConfig>()
+                    .unwrap()
+                    .validate_historical_bars,
+                expected,
+            );
+        });
+    }
+
+    #[rstest]
     fn json_value_to_py_preserves_unsigned_integer() {
         Python::initialize();
         Python::attach(|py| {
@@ -1403,6 +1448,68 @@ mod tests {
                     .extract::<u64>(py)
                     .expect("Python value must remain an unsigned integer"),
                 expected
+            );
+        });
+    }
+    #[rstest]
+    fn test_python_history_validation_live_config_preserves_legacy_positional_signature() {
+        use pyo3::{IntoPyObjectExt, exceptions::PyTypeError, types::PyTuple};
+
+        Python::initialize();
+        Python::attach(|py| {
+            let constructor = py.get_type::<LiveDataEngineConfig>();
+            let positional = PyTuple::new(
+                py,
+                (0..12).map(|index| {
+                    if index == 11 {
+                        true.into_py_any(py).unwrap()
+                    } else {
+                        py.None()
+                    }
+                }),
+            )
+            .unwrap();
+            let config = constructor.call(positional, None).unwrap();
+            let too_many = PyTuple::new(py, (0..13).map(|_| py.None())).unwrap();
+            let positional_error = constructor.call(too_many, None).unwrap_err();
+
+            assert!(config.getattr("debug").unwrap().extract::<bool>().unwrap());
+            assert!(
+                !config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(positional_error.is_instance_of::<PyTypeError>(py));
+        });
+    }
+
+    #[rstest]
+    fn test_python_history_validation_live_config_explicit_none_uses_default() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs
+                .set_item("validate_historical_bars", py.None())
+                .unwrap();
+            let config = py
+                .get_type::<LiveDataEngineConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+
+            assert!(
+                !config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !config
+                    .extract::<LiveDataEngineConfig>()
+                    .unwrap()
+                    .validate_historical_bars
             );
         });
     }

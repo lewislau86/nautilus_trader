@@ -40,6 +40,47 @@ def _load_generate_docstrings_module() -> object:
 generate_docstrings = _load_generate_docstrings_module()
 
 
+def test_bar_observer_docs_use_scope_not_generated_wrappers(tmp_path: Path, monkeypatch) -> None:
+    """
+    Generate both component docs from the owning scope without circular wrapper input.
+    """
+    common = tmp_path / "common" / "src"
+    trading = tmp_path / "trading" / "src"
+    for source in (common, trading):
+        (source / "python").mkdir(parents=True)
+    (common / "python" / "msgbus.rs").write_text(
+        "impl PyMessageBusScope {\n"
+        "    /// Observes native Bars without data commands.\n"
+        "    ///\n    /// # Errors\n    ///\n    /// Returns an error if unregistered.\n"
+        "    pub fn subscribe_bar_topic(&self) -> PyResult<()> { Ok(()) }\n"
+        "    /// Removes only the owned Bar observer.\n"
+        "    pub fn unsubscribe_bar_topic(&self) -> PyResult<()> { Ok(()) }\n}\n",
+    )
+    monkeypatch.setattr(generate_docstrings, "CRATES_DIR", tmp_path)
+    monkeypatch.setattr(generate_docstrings, "ROOT", tmp_path)
+
+    for name, source, wrapper in (
+        ("common", common, "PyDataActor"),
+        ("trading", trading, "PyStrategy"),
+    ):
+        path = source / "python" / "observer.rs"
+        path.write_text(
+            "#[pymethods]\nimpl " + wrapper + " {\n"
+            "    /// Stale wrapper documentation must not become the source.\n"
+            '    #[pyo3(name = "subscribe_bar_topic")]\n'
+            "    fn py_subscribe_bar_topic(&self) -> PyResult<()> { Ok(()) }\n"
+            '    #[pyo3(name = "unsubscribe_bar_topic")]\n'
+            "    fn py_unsubscribe_bar_topic(&self) -> PyResult<()> { Ok(()) }\n}\n",
+        )
+        assert generate_docstrings.process_crate(name, source) == 2
+        output = path.read_text()
+        assert "Observes native Bars without data commands." in output
+        assert "Removes only the owned Bar observer." in output
+        assert "# Errors" in output
+        assert "Stale wrapper" not in output
+        assert generate_docstrings.process_crate(name, source) == 0
+
+
 @pytest.mark.parametrize(
     ("line", "expected"),
     [

@@ -116,6 +116,8 @@ def get_crate_src_dirs(crate_filter: str | None = None) -> list[tuple[str, Path]
 
 def collect_source_docs(  # noqa: C901
     src_dir: Path,
+    *,
+    python_impl: str | None = None,
 ) -> dict[tuple[str | None, str], list[str]]:
     """
     Collect doc comments for items in a crate, excluding python/ files.
@@ -123,13 +125,16 @@ def collect_source_docs(  # noqa: C901
     Returns {(type_name_or_none, item_name): [doc_line, ...]} where lines exclude the
     ``///`` prefix. Free functions and type definitions use ``None`` as the type_name.
     Methods inside ``impl TypeName`` blocks use the enclosing type name.
+    With ``python_impl``, collect only that non-wrapper scope in python/msgbus.rs.
 
     """
     docs: dict[tuple[str | None, str], list[str]] = {}
 
     for rs_file in sorted(src_dir.rglob("*.rs")):
         rel = rs_file.relative_to(src_dir)
-        if rel.parts[0] == "python":
+        if python_impl is not None and rel != Path("python/msgbus.rs"):
+            continue
+        if python_impl is None and rel.parts[0] == "python":
             continue
 
         lines = rs_file.read_text(encoding="utf-8").splitlines()
@@ -187,7 +192,7 @@ def collect_source_docs(  # noqa: C901
                 if fn_m:
                     name = fn_m.group(1)
 
-                    if not is_banner:
+                    if not is_banner and (python_impl is None or current_impl == python_impl):
                         docs[(current_impl, name)] = list(doc_block)
                 else:
                     type_m = re.match(
@@ -198,7 +203,7 @@ def collect_source_docs(  # noqa: C901
                     if type_m:
                         name = type_m.group(1)
 
-                        if not is_banner:
+                        if not is_banner and python_impl is None:
                             docs[(None, name)] = list(doc_block)
 
             doc_block = []
@@ -399,6 +404,19 @@ def process_crate(  # noqa: C901
         print(f"Processing crate: {crate_name}")
 
     source_docs = collect_source_docs(src_dir)
+    # Component Bar observers delegate to a Python-owning scope, not a Rust actor method.
+    # Its non-wrapper method docs are the source; never copy generated wrapper docs back.
+    if crate_name in {"common", "trading"}:
+        scope_docs = collect_source_docs(
+            CRATES_DIR / "common" / "src",
+            python_impl="PyMessageBusScope",
+        )
+        wrapper = "PyDataActor" if crate_name == "common" else "PyStrategy"
+
+        for method in ("subscribe_bar_topic", "unsubscribe_bar_topic"):
+            doc = scope_docs.get(("PyMessageBusScope", method))
+            if doc:
+                source_docs[(wrapper, method)] = doc
     if verbose:
         print(f"  Collected {len(source_docs)} source doc comments")
 

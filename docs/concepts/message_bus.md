@@ -134,6 +134,21 @@ foreign thread, while releasing subscriptions, or when the registered bus is una
 Invalid topics and patterns raise `ValueError`; a non-callable handler raises `TypeError`.
 Priority must be an integer in `[0, 4294967295]`; values outside this range raise `OverflowError`.
 
+## Python Bar topic observation
+
+Registered Python DataActor and Strategy components can observe existing typed Bar publications
+with `subscribe_bar_topic(topic, handler, priority=0)` and remove them with
+`unsubscribe_bar_topic(topic, handler)`. These methods use the native Bar router, not the
+Python-object router used by `subscribe_topic`. The handler receives a native Bar value.
+They do not send data commands, create venue subscriptions, update indicators, or aggregate bars.
+Use `subscribe_bars` when the component needs to request market data.
+
+Priority, callable identity, component ownership, exceptions and lifecycle follow the Python
+topic rules above. Stop retains these raw callbacks; applications requiring stop-time isolation
+must unsubscribe in their stop hook. Reset, disposal and fault cleanup release retained callables.
+Observers cannot veto delivery to later handlers; an integrity guard must separately prevent
+invalid aggregates from reaching its decisions.
+
 ## Messaging styles
 
 NautilusTrader is an **event-driven** framework where components communicate by sending and receiving messages.

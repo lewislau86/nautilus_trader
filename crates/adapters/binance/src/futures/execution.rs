@@ -55,7 +55,7 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
         TrailingOffsetType, TriggerType,
     },
     events::{
@@ -68,7 +68,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
@@ -985,8 +985,8 @@ impl BinanceFuturesExecutionClient {
                         }
                         emitter.send_order_status_report(report.clone());
 
-                        if let Some(error) = identity_conflict {
-                            return Err(error);
+                        if let Some(e) = identity_conflict {
+                            return Err(e);
                         }
                     }
                     log::debug!(
@@ -4448,14 +4448,14 @@ fn validate_algo_submit_response(
     account_id: AccountId,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
-    order_side: nautilus_model::enums::OrderSide,
+    order_side: OrderSide,
     order_type: OrderType,
     quantity: Quantity,
     time_in_force: TimeInForce,
-    price: Option<nautilus_model::types::Price>,
-    trigger_price: Option<nautilus_model::types::Price>,
+    price: Option<Price>,
+    trigger_price: Option<Price>,
     close_position: bool,
-    activation_price: Option<nautilus_model::types::Price>,
+    activation_price: Option<Price>,
     trailing_offset: Option<Decimal>,
     trigger_type: Option<TriggerType>,
 ) -> anyhow::Result<()> {
@@ -4879,7 +4879,7 @@ mod tests {
             InstrumentId::from("BTCUSDT-PERP.BINANCE"),
             Some(ClientOrderId::from("TRAILING-001")),
             VenueOrderId::from("12345"),
-            Some(nautilus_model::enums::OrderSide::Sell),
+            Some(OrderSide::Sell),
             OrderType::TrailingStopMarket,
             TimeInForce::Gtc,
             OrderStatus::Accepted,
@@ -4906,7 +4906,7 @@ mod tests {
                 AccountId::from("BINANCE-001"),
                 InstrumentId::from("BTCUSDT-PERP.BINANCE"),
                 ClientOrderId::from("TRAILING-001"),
-                nautilus_model::enums::OrderSide::Sell,
+                OrderSide::Sell,
                 OrderType::TrailingStopMarket,
                 Quantity::from("0.001"),
                 TimeInForce::Gtc,

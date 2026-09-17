@@ -170,6 +170,15 @@ pub fn register_data_command_endpoint(
         .register(endpoint, handler);
 }
 
+/// Returns whether an ownership-based data command handler is registered for the given endpoint.
+#[must_use]
+pub fn has_data_command_endpoint(endpoint: MStr<Endpoint>) -> bool {
+    get_message_bus()
+        .borrow()
+        .endpoints_data_commands
+        .is_registered(endpoint)
+}
+
 /// Registers a data response handler at an endpoint (ownership-based).
 pub fn register_data_response_endpoint(
     endpoint: MStr<Endpoint>,
@@ -1380,6 +1389,7 @@ pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
             DataResponse::FundingRates(resp) => handler.0.handle(resp),
             DataResponse::OptionChainReferencePrice(resp) => handler.0.handle(resp),
             DataResponse::Bars(resp) => handler.0.handle(resp),
+            DataResponse::BarsRequestFailed(resp) => handler.0.handle(resp.as_ref()),
         }
     } else {
         log::error!("send_response: handler not found for correlation_id '{correlation_id}'");

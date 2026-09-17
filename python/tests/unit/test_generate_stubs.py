@@ -53,12 +53,68 @@ check_pyo3_names = _load_module(
 )
 
 
+def test_wheel_stub_include_excludes_virtual_environments(tmp_path: Path) -> None:
+    """
+    Retain native stubs without explicitly packaging third-party environment files.
+    """
+    wanted = {
+        "nautilus_trader/__init__.pyi",
+        "nautilus_trader/common/__init__.pyi",
+        "nautilus_trader/adapters/binance/__init__.pyi",
+    }
+    unrelated = {".venv/lib/python3.13/site-packages/third_party/__init__.pyi"}
+    for name in wanted | unrelated:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n")
+    patterns = generate_stubs.load_pyproject()["tool"]["maturin"]["include"]
+    included = {
+        path.relative_to(tmp_path).as_posix()
+        for pattern in patterns
+        for path in tmp_path.glob(pattern)
+    }
+    assert included == wanted
+
+
+def test_wheel_excludes_source_bytecode(tmp_path: Path) -> None:
+    """
+    A populated source tree must not leak interpreter-specific cache into the wheel.
+    """
+    unwanted = {
+        "nautilus_trader/__pycache__/__init__.cpython-313.pyc",
+        "nautilus_trader/common/legacy.pyc",
+        "nautilus_trader/common/legacy.pyo",
+    }
+
+    for name in unwanted | {"nautilus_trader/common/__init__.py"}:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    excluded = {
+        path.relative_to(tmp_path).as_posix()
+        for pattern in generate_stubs.load_pyproject()["tool"]["maturin"]["exclude"]
+        for path in tmp_path.glob(pattern)
+        if path.is_file()
+    }
+    assert excluded == unwanted
+
+
 @pytest.mark.parametrize(
     ("platform", "shared", "libdir", "existing", "expected_var", "expected_value"),
     [
         ("linux", 1, "/uv/lib", None, "LD_LIBRARY_PATH", "/uv/lib"),
         ("linux", 1, "/uv/lib", "/existing", "LD_LIBRARY_PATH", f"/uv/lib{os.pathsep}/existing"),
-        ("darwin", 1, "/uv/lib", None, "DYLD_LIBRARY_PATH", "/uv/lib"),
+        ("darwin", 1, "/uv/lib", None, "DYLD_FALLBACK_LIBRARY_PATH", "/uv/lib"),
+        ("darwin", 0, "/uv/lib", None, "DYLD_FALLBACK_LIBRARY_PATH", "/uv/lib"),
+        ("darwin", 0, None, None, None, None),
+        (
+            "darwin",
+            1,
+            "/uv/lib",
+            "/existing",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            f"/uv/lib{os.pathsep}/existing",
+        ),
         ("win32", 1, "/uv/lib", None, None, None),
         ("linux", 0, "/uv/lib", None, None, None),
         ("linux", 1, None, None, None, None),
@@ -85,6 +141,7 @@ def test_python_libdir_env_sets_loader_path(
     )
     monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
     monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
     if existing is not None:
         monkeypatch.setenv(expected_var, existing)
 
@@ -95,8 +152,32 @@ def test_python_libdir_env_sets_loader_path(
     if expected_var is None:
         assert "LD_LIBRARY_PATH" not in env
         assert "DYLD_LIBRARY_PATH" not in env
+        assert "DYLD_FALLBACK_LIBRARY_PATH" not in env
     else:
         assert env[expected_var] == expected_value
+
+
+def test_python_libdir_env_preserves_darwin_cargo_library_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Preserve both libpython and Cargo target library search paths.
+    """
+    monkeypatch.setattr(generate_stubs.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        generate_stubs.sysconfig,
+        "get_config_var",
+        {"Py_ENABLE_SHARED": 1, "LIBDIR": "/uv/lib"}.get,
+    )
+    monkeypatch.setenv("DYLD_LIBRARY_PATH", "/cargo/deps")
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/existing")
+
+    env = generate_stubs.python_libdir_env()
+
+    assert env["DYLD_LIBRARY_PATH"] == "/cargo/deps"
+    assert env["DYLD_FALLBACK_LIBRARY_PATH"] == f"/uv/lib{os.pathsep}/existing"
+    assert os.environ["DYLD_LIBRARY_PATH"] == "/cargo/deps"
+    assert os.environ["DYLD_FALLBACK_LIBRARY_PATH"] == "/existing"
 
 
 def test_python_libdir_env_does_not_mutate_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2006,6 +2087,171 @@ def _parse_stub_enum_variants(stub_root: Path) -> dict[str, list[str]]:
 
 
 SCREAMING_SNAKE_RE = re.compile(r"^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*_?$")
+
+
+def test_historical_bars_stubs_expose_readonly_owned_views() -> None:
+    """
+    Keep history views native, read-only and without public constructors.
+    """
+    module = ast.parse((STUB_ROOT / "common" / "__init__.pyi").read_text(encoding="utf-8"))
+    classes = {node.name: node for node in module.body if isinstance(node, ast.ClassDef)}
+    exports = next(
+        ast.literal_eval(node.value)
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+    )
+    expected = {
+        "HistoricalBarsResponse": (
+            {
+                "correlation_id": "core.UUID4",
+                "client_id": "model.ClientId",
+                "bar_type": "model.BarType",
+                "start": "int | None",
+                "end": "int | None",
+                "ts_init": "int",
+                "historical_outcome": "HistoricalBarsOutcome | None",
+            },
+            {"bars": "list[model.Bar]", "params": "dict | None"},
+        ),
+        "HistoricalBarsOutcome": (
+            {"is_validated": "bool", "error": "str | None"},
+            {
+                "aggregate_bar_types": "list[model.BarType]",
+                "aggregates": "list[HistoricalBarsBatch]",
+            },
+        ),
+        "HistoricalBarsBatch": (
+            {"bar_type": "model.BarType"},
+            {"bars": "list[model.Bar]"},
+        ),
+        "HistoricalBarsRequestFailure": (
+            {
+                "correlation_id": "core.UUID4",
+                "client_id": "model.ClientId | None",
+                "requested_client_id": "model.ClientId | None",
+                "bar_type": "model.BarType",
+                "start": "int | None",
+                "end": "int | None",
+                "limit": "int | None",
+                "request_ts_init": "int",
+                "ts_init": "int",
+                "error": "str",
+            },
+            {"aggregate_bar_types": "list[model.BarType]", "params": "dict | None"},
+        ),
+    }
+
+    for name, (properties, collections) in expected.items():
+        assert name in exports
+        assert f"Py{name}" not in classes
+        assert f"Py{name}" not in exports
+        assert [ast.unparse(value) for value in classes[name].decorator_list] == ["typing.final"]
+        methods = {
+            node.name: node for node in classes[name].body if isinstance(node, ast.FunctionDef)
+        }
+        assert set(methods) == properties.keys() | collections.keys()
+        for member_name, annotation in properties.items():
+            member = methods[member_name]
+            assert [ast.unparse(value) for value in member.decorator_list] == ["property"]
+            assert ast.unparse(member.returns) == annotation
+        for member_name, annotation in collections.items():
+            member = methods[member_name]
+            assert not member.decorator_list
+            assert ast.unparse(member.returns) == annotation
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "legacy_positional_count"),
+    [("data", "DataEngineConfig", 13), ("live", "LiveDataEngineConfig", 12)],
+)
+def test_historical_bars_config_stubs_keep_validation_keyword_only(
+    module_name: str,
+    class_name: str,
+    legacy_positional_count: int,
+) -> None:
+    """
+    Keep historical validation opt-in flags keyword-only.
+    """
+    module = ast.parse((STUB_ROOT / module_name / "__init__.pyi").read_text(encoding="utf-8"))
+    config = next(
+        node for node in module.body if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    methods = {node.name: node for node in config.body if isinstance(node, ast.FunctionDef)}
+    constructor = methods["__new__"]
+    positional = constructor.args.posonlyargs + constructor.args.args
+    assert positional[0].arg == "cls"
+    assert len(positional) - 1 == legacy_positional_count
+    assert [arg.arg for arg in constructor.args.kwonlyargs] == ["validate_historical_bars"]
+    assert ast.unparse(constructor.args.kwonlyargs[0].annotation) == "bool | None"
+    assert len(constructor.args.kw_defaults) == 1
+    assert isinstance(constructor.args.kw_defaults[0], ast.Constant)
+    assert constructor.args.kw_defaults[0].value is None
+    getter = methods["validate_historical_bars"]
+    assert [ast.unparse(value) for value in getter.decorator_list] == ["property"]
+    assert ast.unparse(getter.returns) == "bool"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "response_annotation"),
+    [
+        ("common", "DataActor", "HistoricalBarsResponse"),
+        ("trading", "Strategy", "common.HistoricalBarsResponse"),
+    ],
+)
+def test_historical_bars_callback_stubs_use_public_response_type(
+    module_name: str,
+    class_name: str,
+    response_annotation: str,
+) -> None:
+    """
+    Expose the owned public response type in historical Bar hooks.
+    """
+    module = ast.parse((STUB_ROOT / module_name / "__init__.pyi").read_text(encoding="utf-8"))
+    actor = next(
+        node for node in module.body if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    callback = next(
+        node
+        for node in actor.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_historical_bars_response"
+    )
+    assert [arg.arg for arg in callback.args.args] == ["self", "response"]
+    assert not callback.args.posonlyargs
+    assert not callback.args.kwonlyargs
+    assert ast.unparse(callback.args.args[1].annotation) == response_annotation
+    assert ast.unparse(callback.returns) == "None"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "failure_annotation"),
+    [
+        ("common", "DataActor", "HistoricalBarsRequestFailure"),
+        ("trading", "Strategy", "common.HistoricalBarsRequestFailure"),
+    ],
+)
+def test_historical_bars_failure_callback_stubs_use_public_metadata(
+    module_name: str,
+    class_name: str,
+    failure_annotation: str,
+) -> None:
+    """
+    Expose owned, correlated metadata in historical admission failure hooks.
+    """
+    module = ast.parse((STUB_ROOT / module_name / "__init__.pyi").read_text(encoding="utf-8"))
+    actor = next(
+        node for node in module.body if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    callback = next(
+        node
+        for node in actor.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_historical_bars_request_failed"
+    )
+    assert [arg.arg for arg in callback.args.args] == ["self", "failure"]
+    assert not callback.args.posonlyargs
+    assert not callback.args.kwonlyargs
+    assert ast.unparse(callback.args.args[1].annotation) == failure_annotation
+    assert ast.unparse(callback.returns) == "None"
 
 
 def test_live_stub_exposes_native_live_node_config_signature() -> None:

@@ -316,6 +316,11 @@ impl DataEngine {
             let leg_id = *leg.request_id();
             self.register_request_pipeline_leg(leg_id, parent_id);
 
+            self.capture_historical_bar_source(
+                &leg,
+                used_client_id.unwrap_or_else(|| ClientId::from("CATALOG")),
+            )?;
+
             match self.query_catalog_leg(
                 &leg,
                 catalog_name,
@@ -329,6 +334,16 @@ impl DataEngine {
                     log::error!(
                         "Catalog leg query failed for parent {parent_id} (catalog {catalog_name}): {e}"
                     );
+
+                    if self.config.validate_historical_bars
+                        && matches!(leg, RequestCommand::Bars(_))
+                    {
+                        self.reject_historical_bar_source(
+                            leg_id,
+                            &format!("Historical catalog query failed: {e}"),
+                        );
+                        return Err(e);
+                    }
                     let empty = match build_empty_response(
                         &leg,
                         start_ns,
@@ -371,6 +386,7 @@ impl DataEngine {
     }
 
     fn abort_request_pipeline(&mut self, parent_id: UUID4) {
+        self.discard_historical_bar_sources(parent_id);
         self.request_pipeline_n_components.remove(&parent_id);
         self.request_pipeline_parent_request.remove(&parent_id);
         self.request_pipeline_responses.remove(&parent_id);
@@ -880,6 +896,7 @@ fn with_dates_for_pipeline(
             request_id: new_id,
             ts_init,
             params: cmd.params.clone(),
+            scope: cmd.scope.clone(),
         }),
         // `Join` and the non-date-range variants should never reach this path; the dispatcher
         // gates on `is_date_range_variant` first. Cloning preserves behavior if a caller

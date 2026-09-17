@@ -54,11 +54,12 @@ use crate::capture::builtins::{
     PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE, PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
     PAYLOAD_TYPE_BOOK_RESPONSE, PAYLOAD_TYPE_CANCEL_ALL_ORDERS, PAYLOAD_TYPE_CANCEL_ORDER,
     PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE, PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
-    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_MODIFY_ORDER,
-    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE, PAYLOAD_TYPE_ORDER_STATUS_REPORT,
-    PAYLOAD_TYPE_ORDER_WITH_FILLS, PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT,
-    PAYLOAD_TYPE_QUERY_ORDER, PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER,
-    PAYLOAD_TYPE_SUBSCRIBE_COMMAND, PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE,
+    PAYLOAD_TYPE_MODIFY_ORDER, PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
+    PAYLOAD_TYPE_ORDER_STATUS_REPORT, PAYLOAD_TYPE_ORDER_WITH_FILLS,
+    PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT, PAYLOAD_TYPE_QUERY_ORDER,
+    PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER, PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
 };
 #[cfg(all(test, feature = "defi"))]
 use crate::capture::builtins::{
@@ -178,6 +179,7 @@ pub(crate) const FORENSIC_ONLY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE,
     PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
     PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
+    PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE,
 ];
 
 /// Inclusive event-store `seq` bounds for replay input scans.
@@ -2372,6 +2374,12 @@ mod tests {
         ),
         cache_mutation("reset", CacheMutationRecoveryClass::SnapshotOwned, &[]),
         cache_mutation("dispose", CacheMutationRecoveryClass::SnapshotOwned, &[]),
+        cache_mutation(
+            // Backing-store write barrier, not an event-store payload to capture or replay
+            "drain_database",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
         cache_mutation("flush_db", CacheMutationRecoveryClass::SnapshotOwned, &[]),
         cache_mutation("add", CacheMutationRecoveryClass::SnapshotOwned, &[]),
         cache_mutation(
@@ -3229,6 +3237,83 @@ mod tests {
 
         assert_eq!(report.applied_entries, 0);
         assert_eq!(report.ignored_entries, 1);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn historical_admission_failure_replay_preserves_cache_and_publishes_nothing(
+        #[case] resolved: bool,
+    ) {
+        use nautilus_common::messages::data::{
+            DataResponse, HistoricalBarsRequestFailure, RequestBars, RequestScope,
+        };
+
+        let source = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+        let target = BarType::from("AUD/USD.SIM-5-MINUTE-LAST-INTERNAL");
+        let mut request = RequestBars::new(
+            source,
+            Some("1969-12-31T23:59:59.999999999Z".parse().unwrap()),
+            None,
+            std::num::NonZeroUsize::new(7),
+            Some(ClientId::from("ORIGINAL-HINT")),
+            UUID4::new(),
+            UnixNanos::from(71),
+            None,
+        );
+        request.scope = Some(RequestScope::default());
+        let failure = HistoricalBarsRequestFailure {
+            request,
+            client_id: resolved.then(|| ClientId::from("RESOLVED-SOURCE")),
+            error: "request rejected before source capture".to_string(),
+            aggregate_bar_types: vec![target],
+            ts_init: UnixNanos::from(91),
+        };
+        let encoded = crate::capture::builtins::encode_data_response(
+            &DataResponse::BarsRequestFailed(Box::new(failure)),
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.payload_type.unwrap().as_str(),
+            PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE,
+        );
+        let mut backend = MemoryBackend::new();
+        backend.open_run(manifest("run-replay")).unwrap();
+        backend
+            .append_batch(&[append_payload(
+                1,
+                PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE,
+                encoded.payload,
+            )])
+            .unwrap();
+        let reader = EventStoreReader::new(backend);
+        let mut cache = Cache::default();
+        let mut sentinels = Vec::new();
+        for bar_type in [source, target] {
+            let bar = Bar::new(
+                bar_type,
+                Price::from("1.00"),
+                Price::from("1.01"),
+                Price::from("0.99"),
+                Price::from("1.00"),
+                Quantity::from("3"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            );
+            cache.add_bar(bar).unwrap();
+            sentinels.push(bar);
+        }
+        let bus_calls = Rc::new(Cell::new(0));
+        msgbus::set_bus_tap(Rc::new(CountingTap::new(Rc::clone(&bus_calls))));
+        let _guard = BusTapGuard;
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).unwrap();
+        assert_eq!(report.applied_entries, 0);
+        assert_eq!(report.ignored_entries, 1);
+        assert_eq!(bus_calls.get(), 0);
+        for bar in sentinels {
+            assert_eq!(cache.bar_count(&bar.bar_type), 1);
+            assert_eq!(cache.bar(&bar.bar_type), Some(&bar));
+        }
     }
 
     #[rstest]

@@ -28,7 +28,7 @@ use nautilus_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::Payload;
+use super::{Payload, RequestBars};
 
 /// Trims `data` to the inclusive `[start, end]` window on `ts_init`.
 ///
@@ -502,6 +502,58 @@ impl OptionChainReferencePriceResponse {
     }
 }
 
+/// Engine-authored historical request admission or deadline failure.
+///
+/// This carries original Native request metadata, not a bar payload or reconstructed source.
+/// The requested client hint remains in `request`; `client_id` is only an actually resolved
+/// source, and can be absent. The process-local request scope is never serialized.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoricalBarsRequestFailure {
+    /// Original request intent, including its UUID, bounds, limit and unmodified params.
+    pub request: RequestBars,
+    /// Actually resolved Native source, if admission reached source resolution.
+    pub client_id: Option<ClientId>,
+    /// Explicit request failure diagnostic, without a fabricated source-validation result.
+    pub error: String,
+    /// Standard identities from a successfully parsed original aggregation plan.
+    ///
+    /// Malformed plans remain in original params; an empty list does not mean successful history.
+    pub aggregate_bar_types: Vec<BarType>,
+    /// Engine time at failure creation.
+    pub ts_init: UnixNanos,
+}
+
+/// Actual Native aggregate output for one explicitly requested standard target `BarType`.
+///
+/// Empty data retains its target identity; consumers must not infer ownership from a first bar.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalBarsBatch {
+    /// Standard target identity frozen from the original Native aggregation plan.
+    pub bar_type: BarType,
+    /// Actual Native aggregator emissions, including a valid empty result.
+    pub data: Vec<Bar>,
+}
+
+/// Outcome of opt-in historical source validation and request-local Native aggregation.
+///
+/// The enclosing [`BarsResponse`] carries the original request, client, source and UTC coverage.
+/// This is constructed by the data engine, never trusted from client-echoed response metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HistoricalBarsOutcome {
+    /// The complete original raw source and actual request-local aggregation passed validation.
+    Validated {
+        /// One named batch per original target, in original target order.
+        aggregates: Vec<HistoricalBarsBatch>,
+    },
+    /// The original source, query or aggregation could not be admitted.
+    Failed {
+        /// Explicit failure diagnostic; no partial source or target bars are returned.
+        error: String,
+        /// Requested target identities retained even when no target bar exists.
+        aggregate_bar_types: Vec<BarType>,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BarsResponse {
     pub correlation_id: UUID4,
@@ -512,6 +564,9 @@ pub struct BarsResponse {
     pub start: Option<UnixNanos>,
     pub end: Option<UnixNanos>,
     pub params: Option<Params>,
+    /// Engine-authored outcome, absent for the default partial-history profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_outcome: Option<HistoricalBarsOutcome>,
 }
 
 impl BarsResponse {
@@ -541,6 +596,7 @@ impl BarsResponse {
             start,
             end,
             params,
+            historical_outcome: None,
         }
     }
 }

@@ -33,6 +33,7 @@ pub mod enums;
 pub mod factory;
 pub mod fifo;
 pub mod greeks;
+pub mod history;
 pub mod indicators;
 pub mod listener;
 pub mod logging;
@@ -80,6 +81,10 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::timer::TimeEvent>()?;
     m.add_class::<crate::cache::CacheConfig>()?;
     m.add_class::<crate::python::actor::PyDataActor>()?;
+    m.add_class::<crate::python::history::PyHistoricalBarsResponse>()?;
+    m.add_class::<crate::python::history::PyHistoricalBarsOutcome>()?;
+    m.add_class::<crate::python::history::PyHistoricalBarsBatch>()?;
+    m.add_class::<crate::python::history::PyHistoricalBarsRequestFailure>()?;
     m.add_class::<crate::python::cache::PyCache>()?;
     m.add_class::<crate::python::fifo::PyFifoCache>()?;
     m.add_class::<crate::python::clock::PyClock>()?;

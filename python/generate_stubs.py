@@ -322,18 +322,26 @@ def python_libdir_env() -> dict[str, str]:
     uv-managed CPython is a shared build whose ``libpython`` lives under its own ``lib``
     directory, which is not on the system loader path. The ``python-stub-gen`` binary
     has no rpath, so without this it cannot load ``libpython`` at runtime.
+    Cargo extends ``DYLD_FALLBACK_LIBRARY_PATH`` on macOS and removes build-script
+    search paths outside ``target``; explicitly retain the interpreter's library
+    directory there rather than replacing ``DYLD_LIBRARY_PATH``.
+    macOS distributions can provide a dylib with ``Py_ENABLE_SHARED=0``, so that
+    flag must not suppress the configured loader path on macOS.
 
     """
     env = os.environ.copy()
 
-    if sys.platform == "win32" or not sysconfig.get_config_var("Py_ENABLE_SHARED"):
+    if sys.platform == "win32":
+        return env
+
+    if sys.platform != "darwin" and not sysconfig.get_config_var("Py_ENABLE_SHARED"):
         return env
 
     libdir = sysconfig.get_config_var("LIBDIR")
     if not libdir:
         return env
 
-    var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    var = "DYLD_FALLBACK_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
     existing = env.get(var)
     env[var] = f"{libdir}{os.pathsep}{existing}" if existing else libdir
     return env

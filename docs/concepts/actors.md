@@ -188,6 +188,9 @@ Actors have access to core system components:
 The Python `DataActor` and `Strategy` APIs do not expose `self.msgbus`. Use custom data for
 structured payloads, signals for lightweight values, or
 [topic messaging](message_bus.md#python-topic-messaging) for arbitrary in-process Python objects.
+To observe existing native Bar publications without requesting market data, use
+[`subscribe_bar_topic`](message_bus.md#python-bar-topic-observation) and its matching unsubscribe
+method. These callbacks belong to the registered component and use the typed Bar router.
 
 ### Queue pressure state
 

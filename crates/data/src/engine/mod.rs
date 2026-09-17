@@ -40,6 +40,7 @@ mod streaming;
 
 mod commands;
 mod handlers;
+mod historical_bars;
 mod requests;
 mod time_range;
 
@@ -68,6 +69,7 @@ use futures::future::join_all;
 use handlers::{
     BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, SpreadQuoteHandler,
 };
+use historical_bars::{HistoricalBarDeadline, HistoricalBarSource};
 use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
@@ -75,11 +77,12 @@ use nautilus_common::{
     logging::{RECV, RES},
     messages::data::{
         BarsResponse, BookDeltasResponse, BookDepthResponse, CustomDataResponse, DataCommand,
-        DataResponse, FundingRatesResponse, OptionChainReferencePriceResponse, QuotesResponse,
-        RequestBars, RequestCommand, RequestJoin, RequestOptionChainReferencePrice, RequestQuotes,
-        RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
-        SubscribeBookSnapshots, SubscribeCommand, SubscribeOptionChain, SubscribeOptionGreeks,
-        SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+        DataResponse, FundingRatesResponse, HistoricalBarsOutcome,
+        OptionChainReferencePriceResponse, QuotesResponse, RequestBars, RequestCommand,
+        RequestJoin, RequestOptionChainReferencePrice, RequestQuotes, RequestScope, RequestTrades,
+        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
+        SubscribeCommand, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
+        SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
         UnsubscribeBookDepth10, UnsubscribeBookSnapshots, UnsubscribeCommand,
         UnsubscribeInstrumentStatus, UnsubscribeOptionChain, UnsubscribeOptionGreeks,
         UnsubscribeQuotes, UnsubscribeTrades, is_parent_subscription,
@@ -173,6 +176,8 @@ pub struct DataEngine {
     bar_aggregator_handlers: AHashMap<BarAggregatorKey, Vec<BarAggregatorSubscription>>,
     subscriptions_bar_aggregation: AHashMap<BarType, BarAggregationSubscription>,
     request_bar_aggregations: AHashMap<UUID4, RequestBarAggregation>,
+    historical_bar_sources: AHashMap<UUID4, HistoricalBarSource>,
+    historical_bar_deadlines: AHashMap<UUID4, HistoricalBarDeadline>,
     request_pipeline_parent_request: AHashMap<UUID4, RequestCommand>,
     request_pipeline_n_components: AHashMap<UUID4, usize>,
     request_pipeline_parent_request_id: AHashMap<UUID4, UUID4>,
@@ -253,6 +258,8 @@ impl DataEngine {
             bar_aggregator_handlers: AHashMap::new(),
             subscriptions_bar_aggregation: AHashMap::new(),
             request_bar_aggregations: AHashMap::new(),
+            historical_bar_sources: AHashMap::new(),
+            historical_bar_deadlines: AHashMap::new(),
             request_pipeline_parent_request: AHashMap::new(),
             request_pipeline_n_components: AHashMap::new(),
             request_pipeline_parent_request_id: AHashMap::new(),
@@ -586,6 +593,8 @@ impl DataEngine {
 
     /// Stops all registered data clients and bar aggregator timers.
     pub fn stop(&mut self) {
+        self.discard_all_historical_bar_sources();
+
         for client in self.get_clients_mut() {
             if let Err(e) = client.stop() {
                 log::error!("{e}");
@@ -603,6 +612,8 @@ impl DataEngine {
 
     /// Resets all registered data clients and clears engine state.
     pub fn reset(&mut self) {
+        self.discard_all_historical_bar_sources();
+
         for client in self.get_clients_mut() {
             match client.reset() {
                 Ok(()) => client.clear_subscription_state(),
@@ -989,6 +1000,9 @@ impl DataEngine {
     pub fn execute(&mut self, cmd: DataCommand) {
         match &cmd {
             DataCommand::Subscribe(_) | DataCommand::Unsubscribe(_) => self.command_count += 1,
+            DataCommand::CancelHistoricalBars(_) | DataCommand::ExpireHistoricalBars => {
+                self.command_count += 1;
+            }
             DataCommand::Request(_) => self.request_count += 1,
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(_) => self.request_count += 1,
@@ -1003,6 +1017,14 @@ impl DataEngine {
             DataCommand::Subscribe(c) => self.execute_subscribe(c),
             DataCommand::Unsubscribe(c) => self.execute_unsubscribe(&c),
             DataCommand::Request(c) => self.execute_request(c),
+            DataCommand::CancelHistoricalBars(request_id) => {
+                self.discard_historical_bar_sources(request_id);
+                Ok(())
+            }
+            DataCommand::ExpireHistoricalBars => {
+                self.expire_historical_bar_requests();
+                Ok(())
+            }
             #[cfg(feature = "defi")]
             DataCommand::DefiRequest(c) => self.execute_defi_request(c),
             #[cfg(feature = "defi")]
@@ -1306,10 +1328,34 @@ impl DataEngine {
     /// Returns an error if no client is found for the given client ID or venue,
     /// or if the client fails to process the request.
     pub fn execute_request(&mut self, req: RequestCommand) -> anyhow::Result<()> {
+        if self.config.validate_historical_bars
+            && let RequestCommand::Bars(request) = &req
+        {
+            // A duplicate cannot complete or retire the first request's original response handler
+            anyhow::ensure!(
+                !self
+                    .historical_bar_sources
+                    .contains_key(&request.request_id),
+                "Historical source request ID is already active"
+            );
+            anyhow::ensure!(
+                request.scope.as_ref().is_none_or(RequestScope::is_active),
+                "Historical bar requester session is inactive"
+            );
+        }
+
         // Skip requests for external clients
         if let Some(cid) = req.client_id()
             && self.external_clients.contains(cid)
         {
+            if self.config.validate_historical_bars && matches!(req, RequestCommand::Bars(_)) {
+                let e = anyhow::anyhow!(
+                    "Validated historical bars do not support externally routed clients"
+                );
+                self.reject_unadmitted_historical_bar_request(&req, None, &e.to_string());
+                return Err(e);
+            }
+
             if self.config.debug {
                 log::debug!("Skipping data request for external client {cid}: {req:?}");
             }
@@ -1320,19 +1366,58 @@ impl DataEngine {
             return self.handle_request_join(join);
         }
 
+        if self.config.validate_historical_bars && matches!(req, RequestCommand::Bars(_)) {
+            let mut resolved_client_id = None;
+            let admission = (|| -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    !has_continuous_future_params(request_params(&req)),
+                    "Validated historical bars do not support continuous-future sources"
+                );
+                let client_id = req.client_id().copied();
+                let venue = req.venue().copied();
+                resolved_client_id = self
+                    .get_client(client_id.as_ref(), venue.as_ref())
+                    .map(|client| client.client_id());
+                #[cfg(feature = "streaming")]
+                {
+                    resolved_client_id = resolved_client_id.or_else(|| {
+                        self.catalogs_registered()
+                            .then(|| ClientId::from("CATALOG"))
+                    });
+                }
+                let client_id = resolved_client_id
+                    .ok_or_else(|| anyhow::anyhow!("Historical source has no client or catalog"))?;
+                self.capture_historical_bar_source(&req, client_id)
+            })();
+
+            if let Err(e) = admission {
+                self.reject_unadmitted_historical_bar_request(
+                    &req,
+                    resolved_client_id,
+                    &e.to_string(),
+                );
+                return Err(e);
+            }
+        }
+
         if has_continuous_future_params(request_params(&req)) {
             return self.execute_continuous_future_request(req);
         }
 
         let request_id = *req.request_id();
-        self.prepare_request_bar_aggregators(&req)?;
+        if let Err(e) = self.prepare_request_bar_aggregators(&req) {
+            self.reject_historical_bar_source(request_id, &e.to_string());
+            return Err(e);
+        }
 
         if has_time_range_pipeline_params(request_params(&req))
             && is_time_range_pipeline_variant(&req)
         {
             let result = self.execute_time_range_pipeline_request(req);
-            if result.is_err() {
+            if let Err(e) = &result {
+                self.reject_historical_bar_source(request_id, &e.to_string());
                 self.cleanup_request_bar_aggregators(&request_id);
+                self.discard_historical_bar_sources(request_id);
             }
             return result;
         }
@@ -1340,16 +1425,20 @@ impl DataEngine {
         #[cfg(feature = "streaming")]
         if self.catalogs_registered() && streaming::is_date_range_variant(&req) {
             let result = self.dispatch_date_range_request(req);
-            if result.is_err() {
+            if let Err(e) = &result {
+                self.reject_historical_bar_source(request_id, &e.to_string());
                 self.cleanup_request_bar_aggregators(&request_id);
+                self.discard_historical_bar_sources(request_id);
             }
             return result;
         }
 
         let result = self.dispatch_request_to_client(req);
 
-        if result.is_err() {
+        if let Err(e) = &result {
+            self.reject_historical_bar_source(request_id, &e.to_string());
             self.cleanup_request_bar_aggregators(&request_id);
+            self.historical_bar_sources.remove(&request_id);
         }
 
         result.map(|_| ())
@@ -1361,6 +1450,13 @@ impl DataEngine {
     ) -> anyhow::Result<ClientId> {
         let client_id = req.client_id().copied();
         let venue = req.venue().copied();
+        if self.config.validate_historical_bars
+            && !self.historical_bar_sources.contains_key(req.request_id())
+        {
+            let resolved_client_id =
+                self.resolve_request_client_id(client_id.as_ref(), venue.as_ref())?;
+            self.capture_historical_bar_source(&req, resolved_client_id)?;
+        }
         let Some(client) = self.get_client(client_id.as_ref(), venue.as_ref()) else {
             anyhow::bail!("Cannot handle request: no client found for {client_id:?} {venue:?}");
         };
@@ -1650,7 +1746,11 @@ impl DataEngine {
 
     fn prepare_request_bar_aggregators(&mut self, req: &RequestCommand) -> anyhow::Result<()> {
         let request_id = *req.request_id();
-        let Some(state) = request_bar_aggregation_from_params(request_params(req))? else {
+        let state = request_bar_aggregation_from_params(request_params(req))?;
+        if self.config.validate_historical_bars && matches!(req, RequestCommand::Bars(_)) {
+            return self.freeze_historical_bar_aggregation(request_id, state);
+        }
+        let Some(state) = state else {
             return Ok(());
         };
 
@@ -1727,8 +1827,18 @@ impl DataEngine {
                 .collect();
             let cache = self.cache.clone();
             let validate_sequence = self.config.validate_data_sequence;
+            let outputs = self
+                .historical_bar_sources
+                .get(&request_id)
+                .map(|source| source.outputs.clone());
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
-                process_engine_bar(&cache, validate_sequence, false, bar);
+                if let Some(outputs) = &outputs {
+                    if !outputs.borrow_mut().record(bar) {
+                        return;
+                    }
+                } else {
+                    process_engine_bar(&cache, validate_sequence, false, bar);
+                }
 
                 for aggregator in &downstream {
                     aggregator.borrow_mut().handle_bar(bar);
@@ -1961,7 +2071,14 @@ impl DataEngine {
 
         self.response_count += 1;
 
-        resp.trim_to_bounds();
+        let original_response_id = *resp.correlation_id();
+        if !self.validate_historical_bar_response(&mut resp) {
+            return;
+        }
+
+        if !self.config.validate_historical_bars || !matches!(resp, DataResponse::Bars(_)) {
+            resp.trim_to_bounds();
+        }
 
         if let Some(parent_id) = continuous_future_parent_request_id(response_params(&resp)) {
             self.handle_continuous_future_child_response(parent_id, &resp);
@@ -1969,13 +2086,23 @@ impl DataEngine {
         }
 
         let Some(resp) = self.handle_request_pipeline_response(resp) else {
+            self.historical_bar_sources.remove(&original_response_id);
             return;
         };
+        let mut resp = resp;
+        if *resp.correlation_id() != original_response_id {
+            self.historical_bar_sources.remove(&original_response_id);
+
+            if !self.validate_historical_bar_response(&mut resp) {
+                return;
+            }
+        }
 
         if let Some(parent_id) = self
             .time_range_pipeline_parent_request_id
             .remove(resp.correlation_id())
         {
+            self.historical_bar_sources.remove(resp.correlation_id());
             self.handle_time_range_pipeline_child_response(parent_id, &resp);
             return;
         }
@@ -1989,6 +2116,10 @@ impl DataEngine {
         }
 
         let correlation_id = *resp.correlation_id();
+
+        if !self.complete_historical_bar_response(&mut resp) {
+            return;
+        }
 
         match &resp {
             DataResponse::Instrument(r) => {
@@ -2016,6 +2147,15 @@ impl DataEngine {
                 if !log_if_empty_response(&r.data, &r.bar_type, &correlation_id) {
                     self.handle_bars(&r.data);
                 }
+
+                if self.config.validate_historical_bars
+                    && let Some(HistoricalBarsOutcome::Validated { aggregates }) =
+                        &r.historical_outcome
+                {
+                    for batch in aggregates {
+                        self.handle_bars(&batch.data);
+                    }
+                }
             }
             DataResponse::Book(r) => self.handle_book_response(&r.data),
             DataResponse::BookDeltas(r) => {
@@ -2033,10 +2173,16 @@ impl DataEngine {
                 return self.handle_option_chain_reference_price_response(&correlation_id, r);
             }
             DataResponse::Data(_) => {}
+            DataResponse::BarsRequestFailed(_) => {
+                log::error!("Rejecting client-supplied historical request failure");
+                return;
+            }
         }
 
         self.process_request_bar_aggregation_response(&resp);
 
+        self.historical_bar_sources.remove(&correlation_id);
+        self.retire_historical_bar_deadline(&correlation_id);
         msgbus::send_response(&correlation_id, &resp);
     }
 
@@ -2067,6 +2213,10 @@ impl DataEngine {
             return Some(resp);
         };
 
+        if !self.historical_bar_pipeline_has_capacity(parent_id, &resp) {
+            return None;
+        }
+
         let Some(buf) = self.request_pipeline_responses.get_mut(&parent_id) else {
             log::error!("Pipeline response buffer missing for parent {parent_id} (leg {leg_id})");
             return Some(resp);
@@ -2089,7 +2239,13 @@ impl DataEngine {
         let parent = self.request_pipeline_parent_request.remove(&parent_id);
 
         for leg in &mut legs {
-            leg.trim_to_bounds();
+            if !self.config.validate_historical_bars || !matches!(leg, DataResponse::Bars(_)) {
+                leg.trim_to_bounds();
+            }
+        }
+
+        if !self.validate_historical_bar_pipeline_legs(parent_id, &legs) {
+            return None;
         }
 
         let (parent_start, parent_end) = parent_request_window(parent.as_ref());
@@ -2123,7 +2279,9 @@ impl DataEngine {
         // already trimmed against their own bounds at the top of `response()`, so a
         // second pass would discard data from later legs whose bounds the parent never
         // constrained.
-        if parent_start.is_some() || parent_end.is_some() {
+        if (parent_start.is_some() || parent_end.is_some())
+            && (!self.config.validate_historical_bars || !matches!(rebuilt, DataResponse::Bars(_)))
+        {
             rebuilt.trim_to_bounds();
         }
 
@@ -2453,6 +2611,7 @@ impl DataEngine {
         bar: Bar,
     ) {
         let aggregator_request_id = state.aggregator_request_id(request_id);
+        let validated_source = self.historical_bar_sources.contains_key(&request_id);
 
         for bar_type in &state.bar_types {
             if !bar_type.is_composite()
@@ -2462,7 +2621,13 @@ impl DataEngine {
             }
 
             self.update_request_bar_aggregator(*bar_type, aggregator_request_id, |aggregator| {
-                aggregator.handle_bar(bar);
+                if validated_source {
+                    // Replay the complete validated event grid on Native's historical clock,
+                    // retain the original bar, including its independent receipt timestamp.
+                    aggregator.update_bar(bar, bar.volume, bar.ts_event);
+                } else {
+                    aggregator.handle_bar(bar);
+                }
             });
         }
     }
@@ -6401,6 +6566,8 @@ fn rebind_response_correlation(mut resp: DataResponse, new_id: UUID4) -> DataRes
         DataResponse::FundingRates(r) => r.correlation_id = new_id,
         DataResponse::OptionChainReferencePrice(r) => r.correlation_id = new_id,
         DataResponse::Bars(r) => r.correlation_id = new_id,
+        // Admission failures retain original intent and never enter a response pipeline
+        DataResponse::BarsRequestFailed(_) => {}
     }
     resp
 }

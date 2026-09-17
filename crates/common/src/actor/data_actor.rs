@@ -68,10 +68,11 @@ use crate::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-            QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
-            RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument,
-            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            DataCommand, FundingRatesResponse, HistoricalBarsOutcome, HistoricalBarsRequestFailure,
+            InstrumentResponse, InstrumentsResponse, QuotesResponse, RequestBars,
+            RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCommand,
+            RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestQuotes, RequestScope, RequestTrades, SubscribeBars, SubscribeBookDeltas,
             SubscribeBookDepth10, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
             SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
@@ -698,6 +699,35 @@ pub trait DataActor {
     /// Returns an error if handling the historical bars fails.
     #[allow(unused_variables)]
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Receives an opt-in, engine-authored historical outcome under its original request UUID.
+    ///
+    /// Target indicator updates precede a validated callback. Failed outcomes do not update any
+    /// indicators. The default implementation delegates once to the legacy raw-bar hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the original historical response fails.
+    fn on_historical_bars_response(&mut self, response: &BarsResponse) -> anyhow::Result<()> {
+        self.on_historical_bars(&response.data)
+    }
+
+    /// Receives an engine-authored admission or deadline failure under the original request UUID.
+    ///
+    /// No source or target indicator updates precede this hook. The optional resolved client is
+    /// separate from the original requested hint; absent sources are never fabricated.
+    /// This does not call the legacy raw-list hook or present a failed request as valid empty data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handling the original request failure fails.
+    #[allow(unused_variables)]
+    fn on_historical_bars_request_failed(
+        &mut self,
+        failure: &HistoricalBarsRequestFailure,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1388,21 +1418,93 @@ pub trait DataActor {
         }
     }
 
-    /// Handles a bars response.
+    /// Handles a bars response, closing opted-in requesters after indicator or callback errors.
+    ///
+    /// Default-profile errors retain their existing log-only behavior. Completed source facts
+    /// and indicator effects are not rolled back by requester-local lifecycle failure handling.
     fn handle_bars_response(&mut self, resp: &BarsResponse)
     where
-        Self: DataActorNative,
+        Self: DataActorNative + Component,
     {
         log_received_bulk("BarsResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
-        if let Err(e) = self.core().handle_indicators_for_bars(&resp.data) {
-            log_error(&e);
+        if matches!(
+            resp.historical_outcome,
+            Some(HistoricalBarsOutcome::Failed { .. })
+        ) {
+            if let Err(e) = self.on_historical_bars_response(resp) {
+                close_historical_requester_after_error(
+                    self,
+                    &resp.correlation_id,
+                    "failed outcome hook",
+                    &e,
+                );
+            }
             return;
         }
 
-        if let Err(e) = self.on_historical_bars(&resp.data) {
-            log_error(&e);
+        if let Err(e) = self.core().handle_indicators_for_bars(&resp.data) {
+            if resp.historical_outcome.is_some() {
+                close_historical_requester_after_error(
+                    self,
+                    &resp.correlation_id,
+                    "source indicators",
+                    &e,
+                );
+            } else {
+                log_error(&e);
+            }
+            return;
+        }
+
+        let result = if let Some(HistoricalBarsOutcome::Validated { aggregates }) =
+            &resp.historical_outcome
+        {
+            for batch in aggregates {
+                if let Err(e) = self.core().handle_indicators_for_bars(&batch.data) {
+                    close_historical_requester_after_error(
+                        self,
+                        &resp.correlation_id,
+                        "target indicators",
+                        &e,
+                    );
+                    return;
+                }
+            }
+            self.on_historical_bars_response(resp)
+        } else {
+            self.on_historical_bars(&resp.data)
+        };
+
+        if let Err(e) = result {
+            if resp.historical_outcome.is_some() {
+                close_historical_requester_after_error(
+                    self,
+                    &resp.correlation_id,
+                    "validated outcome hook",
+                    &e,
+                );
+            } else {
+                log_error(&e);
+            }
+        }
+    }
+
+    /// Handles a correlated request failure, closing the requester if its callback fails.
+    ///
+    /// Admission metadata does not update indicators or historical bars.
+    fn handle_historical_bars_request_failed(&mut self, failure: &HistoricalBarsRequestFailure)
+    where
+        Self: DataActorNative + Component,
+    {
+        if let Err(e) = self.on_historical_bars_request_failed(failure) {
+            close_historical_requester_after_error(
+                self,
+                &failure.request.request_id,
+                "request failure hook",
+                &e,
+            );
         }
     }
 
@@ -2897,9 +2999,16 @@ pub trait DataActor {
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.core().actor_id().inner();
-        let handler = ShareableMessageHandler::from_typed(move |resp: &BarsResponse| {
+        let handler = ShareableMessageHandler::from_any(move |message| {
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                actor.handle_bars_response(resp);
+                if let Some(resp) = message.downcast_ref::<BarsResponse>() {
+                    actor.handle_bars_response(resp);
+                } else if let Some(failure) = message.downcast_ref::<HistoricalBarsRequestFailure>()
+                {
+                    actor.handle_historical_bars_request_failed(failure);
+                } else {
+                    log::error!("Unexpected historical bar response payload for {actor_id}");
+                }
             } else {
                 log::error!("Actor {actor_id} not found for bars response handling");
             }
@@ -3003,6 +3112,7 @@ where
     }
 
     fn release_subscriptions(&mut self) {
+        self.core_mut().cancel_pending_bar_requests();
         self.core_mut().unsubscribe_all();
     }
 
@@ -3012,7 +3122,23 @@ where
 
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
         let core = self.core_mut();
-        core.state = core.state.transition(&trigger)?;
+        let next_state = core.state.transition(&trigger)?;
+        if matches!(
+            trigger,
+            ComponentTrigger::Stop
+                | ComponentTrigger::Reset
+                | ComponentTrigger::Fault
+                | ComponentTrigger::Dispose
+        ) {
+            core.cancel_pending_bar_requests();
+        } else if matches!(
+            next_state,
+            ComponentState::Ready | ComponentState::Starting | ComponentState::Resuming
+        ) && !core.bar_request_scope.borrow().is_active()
+        {
+            *core.bar_request_scope.borrow_mut() = RequestScope::default();
+        }
+        core.state = next_state;
 
         #[cfg(feature = "python")]
         if core.state == ComponentState::Disposed {
@@ -3110,6 +3236,8 @@ pub struct DataActorCore {
     indicators: Indicators,
     warning_events: AHashSet<String>, // TODO: TBD
     pending_requests: AHashMap<UUID4, Option<RequestCallback>>,
+    bar_request_scope: Rc<RefCell<RequestScope>>,
+    pending_bar_requests: Rc<RefCell<AHashSet<UUID4>>>,
     signal_classes: AHashMap<String, String>,
     #[cfg(feature = "defi")]
     block_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<Block>>>,
@@ -4001,6 +4129,8 @@ impl DataActorCore {
             indicators: Indicators::default(),
             warning_events: AHashSet::new(),
             pending_requests: AHashMap::new(),
+            bar_request_scope: Rc::new(RefCell::new(RequestScope::default())),
+            pending_bar_requests: Rc::new(RefCell::new(AHashSet::new())),
             signal_classes: AHashMap::new(),
             #[cfg(feature = "defi")]
             block_handlers: AHashMap::new(),
@@ -5702,7 +5832,10 @@ impl DataActorCore {
         Ok(request_id)
     }
 
-    /// Requests bars for the actor.
+    /// Requests bars for the actor's current session.
+    ///
+    /// Stop/reset/fault/dispose invalidate pending requests before user hooks. A new session uses
+    /// a fresh process-local scope, so late replies cannot update the new actor's indicators.
     ///
     /// # Errors
     ///
@@ -5726,6 +5859,12 @@ impl DataActorCore {
              request aggregation via the `bar_types` params instead",
         );
 
+        let scope = self.bar_request_scope.borrow().clone();
+        anyhow::ensure!(
+            scope.is_active(),
+            "Historical bar requester session is inactive"
+        );
+
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
@@ -5739,15 +5878,60 @@ impl DataActorCore {
             request_id,
             ts_init: now.into(),
             params,
+            scope: Some(scope.clone()),
+        });
+
+        let pending = self.pending_bar_requests.clone();
+        let scoped_handler = ShareableMessageHandler::from_any(move |response| {
+            let correlation_id = if let Some(bars) = response.downcast_ref::<BarsResponse>() {
+                bars.correlation_id
+            } else if let Some(failure) = response.downcast_ref::<HistoricalBarsRequestFailure>() {
+                failure.request.request_id
+            } else {
+                return;
+            };
+
+            if correlation_id != request_id {
+                return;
+            }
+            let was_pending = pending.borrow_mut().remove(&request_id);
+            if was_pending && scope.is_active() {
+                handler.0.handle(response);
+            }
         });
 
         get_message_bus()
             .borrow_mut()
-            .register_response_handler(command.request_id(), handler)?;
+            .register_response_handler(command.request_id(), scoped_handler)?;
+
+        self.pending_bar_requests.borrow_mut().insert(request_id);
 
         self.send_data_cmd(DataCommand::Request(command));
 
         Ok(request_id)
+    }
+
+    /// Invalidates pending bar requests before lifecycle hooks, then retires Native staged sources.
+    ///
+    /// The shared scope closes the command/response race immediately. Staging cleanup follows the
+    /// ordinary runner command route and does not wait for an exchange or catalog reply.
+    /// Native strategy stop decisions also call this on the owner thread before managed exit can
+    /// defer the later component-stop hook. Live subscriptions and cached bars are unaffected.
+    pub fn cancel_pending_bar_requests(&self) {
+        self.bar_request_scope.borrow().invalidate();
+        let mut request_ids: Vec<_> = self.pending_bar_requests.borrow_mut().drain().collect();
+        request_ids.sort_unstable_by_key(UUID4::as_bytes);
+        {
+            let bus = get_message_bus();
+            let mut bus = bus.borrow_mut();
+            for request_id in &request_ids {
+                let _ = bus.take_response_handler(request_id);
+            }
+        }
+
+        for request_id in request_ids {
+            self.send_data_cmd(DataCommand::CancelHistoricalBars(request_id));
+        }
     }
 
     /// Requests funding rates for the actor.
@@ -5904,6 +6088,39 @@ fn check_timestamps(
     }
 
     Ok(())
+}
+
+fn close_historical_requester_after_error<T>(
+    actor: &mut T,
+    correlation_id: &UUID4,
+    stage: &str,
+    e: &anyhow::Error,
+) where
+    T: DataActorNative + Component + ?Sized,
+{
+    let component_id = actor.component_id();
+    log::error!(
+        component = component_id.as_str();
+        "Historical bars delivery failed for request {correlation_id} during {stage}: {e}"
+    );
+
+    // Close history even if author code changed the component into a non-faultable state,
+    // Ready cannot fault, so retire it through the existing disposal lifecycle instead.
+    actor.core().cancel_pending_bar_requests();
+    let result = if actor.is_ready() {
+        actor.dispose()
+    } else {
+        actor.fault()
+    };
+
+    if let Err(e) = result {
+        // Failed disposal deliberately retains subscriptions; explicit retirement must release them
+        actor.release_subscriptions();
+        log::error!(
+            component = component_id.as_str();
+            "Historical bars requester closure failed for request {correlation_id}: {e}"
+        );
+    }
 }
 
 fn log_error(e: &anyhow::Error) {

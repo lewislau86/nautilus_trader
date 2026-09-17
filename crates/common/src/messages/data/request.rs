@@ -13,7 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::num::NonZeroUsize;
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos};
@@ -387,6 +393,32 @@ impl RequestBookDeltas {
     }
 }
 
+/// Process-local lifetime shared by an actor's pending historical bar requests.
+///
+/// Invalidation is permanent for a scope. Starting a fresh actor session creates a new scope,
+/// so queued requests from an earlier session cannot acquire the new session's lifetime.
+/// This is not an exchange cancellation or a serializable request identity.
+#[derive(Clone, Debug)]
+pub struct RequestScope(Arc<AtomicBool>);
+
+impl Default for RequestScope {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl RequestScope {
+    /// Returns whether the original requesting actor session remains valid.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestBars {
     pub bar_type: BarType,
@@ -397,6 +429,9 @@ pub struct RequestBars {
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
     pub params: Option<Params>,
+    /// Original process-local requester lifetime; never sent to an exchange or serialized.
+    #[serde(skip)]
+    pub scope: Option<RequestScope>,
 }
 
 impl RequestBars {
@@ -421,6 +456,7 @@ impl RequestBars {
             request_id,
             ts_init,
             params,
+            scope: None,
         }
     }
 }
@@ -489,5 +525,49 @@ impl RequestJoin {
             params: self.params.clone(),
             correlation_id: Some(self.request_id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    #[rstest]
+    fn test_request_scope_invalidation_is_shared_and_cannot_reactivate_old_session() {
+        let scope = RequestScope::default();
+        let queued_child = scope.clone();
+        assert!(scope.is_active());
+        assert!(queued_child.is_active());
+        scope.invalidate();
+        assert!(!queued_child.is_active());
+        let new_session = RequestScope::default();
+        assert!(new_session.is_active());
+        assert!(!scope.is_active());
+    }
+
+    #[rstest]
+    fn test_bar_request_scope_is_not_serialized_or_added_to_params() {
+        let mut request = RequestBars::new(
+            BarType::from("DOGEUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"),
+            None,
+            None,
+            None,
+            Some(ClientId::from("BINANCE")),
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(serde_json::from_value(json!({"bar_types": []})).unwrap()),
+        );
+        request.scope = Some(RequestScope::default());
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("scope").is_none());
+        assert_eq!(encoded["params"], json!({"bar_types": []}));
+        let decoded: RequestBars = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.scope.is_none());
+        assert_eq!(decoded.request_id, request.request_id);
+        assert_eq!(decoded.bar_type, request.bar_type);
+        assert_eq!(decoded.params, request.params);
     }
 }

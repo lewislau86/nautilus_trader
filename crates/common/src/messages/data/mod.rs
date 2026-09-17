@@ -43,12 +43,13 @@ pub const PARAMS_IS_PARENT: &str = "is_parent";
 pub use request::{
     RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCustomData,
     RequestFundingRates, RequestInstrument, RequestInstruments, RequestJoin,
-    RequestOptionChainReferencePrice, RequestQuotes, RequestTrades,
+    RequestOptionChainReferencePrice, RequestQuotes, RequestScope, RequestTrades,
 };
 pub use response::{
     BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-    FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-    OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
+    FundingRatesResponse, HistoricalBarsBatch, HistoricalBarsOutcome, HistoricalBarsRequestFailure,
+    InstrumentResponse, InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse,
+    TradesResponse,
 };
 pub use subscribe::{
     SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
@@ -71,6 +72,15 @@ use crate::messages::defi::{DefiRequestCommand, DefiSubscribeCommand, DefiUnsubs
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataCommand {
     Request(RequestCommand),
+    /// Releases opt-in historical source staging for an original bar request UUID.
+    ///
+    /// This does not cancel exchange orders, abort an in-flight transport or clear Native cache.
+    CancelHistoricalBars(UUID4),
+    /// Completes opt-in historical requests whose original Engine-clock deadlines have elapsed.
+    ///
+    /// An old queued alert cannot expire a new request before its own deadline. This does not abort
+    /// transport operations, cancel exchange orders or clear Native cache.
+    ExpireHistoricalBars,
     Subscribe(SubscribeCommand),
     Unsubscribe(UnsubscribeCommand),
     #[cfg(feature = "defi")]
@@ -698,6 +708,8 @@ pub enum DataResponse {
     FundingRates(FundingRatesResponse),
     OptionChainReferencePrice(OptionChainReferencePriceResponse),
     Bars(BarsResponse),
+    /// Engine-authored admission failure with original intent, not an empty bar response.
+    BarsRequestFailed(Box<HistoricalBarsRequestFailure>),
 }
 
 impl DataResponse {
@@ -719,6 +731,7 @@ impl DataResponse {
             Self::FundingRates(resp) => &resp.correlation_id,
             Self::OptionChainReferencePrice(resp) => &resp.correlation_id,
             Self::Bars(resp) => &resp.correlation_id,
+            Self::BarsRequestFailed(resp) => &resp.request.request_id,
         }
     }
 
@@ -737,6 +750,7 @@ impl DataResponse {
             Self::FundingRates(_) => "FundingRates",
             Self::OptionChainReferencePrice(_) => "OptionChainReferencePrice",
             Self::Bars(_) => "Bars",
+            Self::BarsRequestFailed(_) => "BarsRequestFailed",
         }
     }
 
@@ -756,6 +770,7 @@ impl DataResponse {
             Self::FundingRates(resp) => Some(resp.data.len()),
             Self::OptionChainReferencePrice(_) => None,
             Self::Bars(resp) => Some(resp.data.len()),
+            Self::BarsRequestFailed(_) => None,
         }
     }
 
@@ -779,6 +794,7 @@ impl DataResponse {
             Self::Data(_)
             | Self::Instrument(_)
             | Self::Book(_)
+            | Self::BarsRequestFailed(_)
             | Self::OptionChainReferencePrice(_) => {}
         }
     }

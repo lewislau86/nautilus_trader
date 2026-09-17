@@ -64,11 +64,11 @@ macro_rules! response {
             fn py_new(py: Python<'_>, client_id: ClientId, $key: $key_type, data: $data,
                 correlation_id: UUID4, ts_init: u64, start: Option<u64>, end: Option<u64>,
                 params: Option<Py<PyDict>>) -> PyResult<Self> {
-                Ok(Self { response: $response {
-                    client_id, $key, data, correlation_id, ts_init: ts_init.into(),
-                    start: start.map(Into::into), end: end.map(Into::into),
-                    params: params.as_ref().map(|params| pydict_to_params(py, params)).transpose()?.flatten(),
-                }})
+                Ok(Self { response: $response::new(
+                    correlation_id, client_id, $key, data,
+                    start.map(Into::into), end.map(Into::into), ts_init.into(),
+                    params.as_ref().map(|params| pydict_to_params(py, params)).transpose()?.flatten(),
+                )})
             }
 
             #[getter]
@@ -584,4 +584,44 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBookDepthResponse>()?;
     m.add_class::<PyBookResponse>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::python::history::PyHistoricalBarsResponse;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_python_history_live_response_producer_cannot_author_validation() {
+        Python::initialize();
+        Python::attach(|py| {
+            let client_id = ClientId::from("SIM");
+            let bar_type = BarType::from("AUD/USD.SIM-1-MINUTE-LAST-EXTERNAL");
+            let request_id = UUID4::new();
+            let constructor = py.get_type::<PyBarsResponse>();
+            let response = constructor
+                .call1((client_id, bar_type, Vec::<Bar>::new(), request_id, u64::MAX))
+                .unwrap();
+            let (delivered_client, delivered) = extract_response(&response).unwrap();
+            let DataResponse::Bars(delivered) = delivered else {
+                panic!("expected a Native bars response");
+            };
+            let view = Py::new(py, PyHistoricalBarsResponse::from(delivered.clone())).unwrap();
+            let rejected = extract_response(view.bind(py).as_any()).unwrap_err();
+
+            assert_eq!(delivered_client, client_id);
+            assert_eq!(delivered.client_id, client_id);
+            assert_eq!(delivered.correlation_id, request_id);
+            assert_eq!(delivered.bar_type, bar_type);
+            assert_eq!(delivered.ts_init.as_u64(), u64::MAX);
+            assert_eq!(delivered.start, None);
+            assert_eq!(delivered.end, None);
+            assert_eq!(delivered.params, None);
+            assert!(delivered.data.is_empty());
+            assert_eq!(delivered.historical_outcome, None);
+            assert!(rejected.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
 }

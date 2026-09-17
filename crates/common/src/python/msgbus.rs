@@ -16,7 +16,7 @@
 //! Python bindings for the message bus, including configuration types and the
 //! [`PyMessageBus`] wrapper that routes Python events through the Rust
 //! thread-local [`MessageBus`] via the Any-based dispatch path.
-//! [`PyMessageBusScope`] owns each component's Python subscriptions.
+//! [`PyMessageBusScope`] owns each component's Python and typed Bar subscriptions.
 
 use std::{
     any::Any,
@@ -31,7 +31,7 @@ use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
 };
-use nautilus_model::identifiers::TraderId;
+use nautilus_model::{data::Bar, identifiers::TraderId};
 use pyo3::{Py, Python, prelude::*, types::PyBytes};
 use ustr::Ustr;
 
@@ -294,8 +294,8 @@ impl Debug for PyMessage {
 
 /// Adapts a Python callable as a [`ShareableMessageHandler`].
 ///
-/// Expects messages to be [`PyMessage`] instances. Acquires the GIL and calls
-/// the Python callable with the inner Python object.
+/// The Any handler unwraps [`PyMessage`]; the Bar handler passes a native Bar value.
+/// Both acquire the GIL and invoke the retained callable.
 pub struct PyCallableHandler {
     id: Ustr,
     callable: Py<PyAny>,
@@ -349,6 +349,20 @@ impl Handler<dyn Any> for PyCallableHandler {
 fn make_handler(py: Python<'_>, callable: Py<PyAny>) -> PyResult<ShareableMessageHandler> {
     let handler = PyCallableHandler::new(py, callable)?;
     Ok(TypedHandler(Rc::new(handler) as Rc<dyn Handler<dyn Any>>))
+}
+
+impl Handler<Bar> for PyCallableHandler {
+    fn id(&self) -> Ustr {
+        self.id
+    }
+
+    fn handle(&self, bar: &Bar) {
+        Python::attach(|py| {
+            if let Err(e) = self.callable.call1(py, (*bar,)) {
+                log::error!("Python Bar handler {id} failed: {e}", id = self.id);
+            }
+        });
+    }
 }
 
 /// Python message bus backed by the Rust thread-local [`MessageBus`].
@@ -823,6 +837,7 @@ fn parse_pattern(pattern: &str) -> PyResult<MStr<Pattern>> {
 pub struct PyMessageBusScope {
     bus: RefCell<Weak<RefCell<MessageBus>>>,
     subscriptions: RefCell<Vec<ScopedSubscription>>,
+    bar_subscriptions: RefCell<Vec<ScopedBarSubscription>>,
     clearing: Cell<bool>,
 }
 
@@ -921,6 +936,79 @@ impl PyMessageBusScope {
         Ok(())
     }
 
+    /// Observes native Bar publications matching a topic pattern.
+    ///
+    /// Uses the typed Bar router, without sending data commands or creating venue subscriptions.
+    /// Higher priorities run first. Identity, ownership and lifecycle match `subscribe_topic`;
+    /// duplicate subscriptions are a no-op. Handler errors are logged and do not veto delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    pub fn subscribe_bar_topic(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+        let identity = CallableIdentity::new(handler.bind(py))?;
+        self.active_bus()?;
+
+        if self
+            .bar_subscriptions
+            .borrow()
+            .iter()
+            .any(|sub| sub.pattern == pattern && sub.identity == identity)
+        {
+            return Ok(());
+        }
+
+        let id = format!("python-component-bar:{}", UUID4::new()).into();
+        let handler =
+            TypedHandler(Rc::new(PyCallableHandler::with_id(id, handler)) as Rc<dyn Handler<Bar>>);
+        msgbus_api::subscribe_bars(pattern, handler.clone(), Some(priority));
+        self.bar_subscriptions
+            .borrow_mut()
+            .push(ScopedBarSubscription {
+                pattern,
+                identity,
+                handler,
+            });
+        Ok(())
+    }
+
+    /// Removes this component's exact native Bar pattern and callable subscription.
+    ///
+    /// An absent subscription is a no-op. A callback already selected for synchronous publication
+    /// may still run. This sends no data command and does not affect venue subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    pub fn unsubscribe_bar_topic(&self, topic: &str, handler: &Bound<'_, PyAny>) -> PyResult<()> {
+        let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+        let identity = CallableIdentity::new(handler)?;
+        let bus = self.active_bus()?;
+
+        let removed = {
+            let mut subscriptions = self.bar_subscriptions.borrow_mut();
+            subscriptions
+                .iter()
+                .position(|sub| sub.pattern == pattern && sub.identity == identity)
+                .map(|index| subscriptions.remove(index))
+        };
+
+        if let Some(sub) = removed {
+            bus.borrow_mut()
+                .router_bars
+                .unsubscribe(sub.pattern, &sub.handler);
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn invalidate(&self) {
         *self.bus.borrow_mut() = Weak::new();
     }
@@ -931,16 +1019,22 @@ impl PyMessageBusScope {
         }
 
         let subscriptions = std::mem::take(&mut *self.subscriptions.borrow_mut());
+        let bar_subscriptions = std::mem::take(&mut *self.bar_subscriptions.borrow_mut());
 
         if let Some(bus) = self.bus.borrow().upgrade() {
             let mut bus = bus.borrow_mut();
             for sub in &subscriptions {
                 bus.unsubscribe_any(sub.pattern, &sub.handler);
             }
+
+            for sub in &bar_subscriptions {
+                bus.router_bars.unsubscribe(sub.pattern, &sub.handler);
+            }
         }
 
         // Callable finalizers may re-enter Python; release them after all bookkeeping borrows
         drop(subscriptions);
+        drop(bar_subscriptions);
         self.clearing.set(false);
     }
 
@@ -971,6 +1065,13 @@ struct ScopedSubscription {
     pattern: MStr<Pattern>,
     identity: CallableIdentity,
     handler: ShareableMessageHandler,
+}
+
+#[derive(Debug)]
+struct ScopedBarSubscription {
+    pattern: MStr<Pattern>,
+    identity: CallableIdentity,
+    handler: TypedHandler<Bar>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1005,7 +1106,7 @@ mod tests {
     use std::any::Any;
 
     use nautilus_model::{
-        data::QuoteTick,
+        data::{QuoteTick, stubs::stub_bar},
         identifiers::{ActorId, ComponentId},
         types::{Price, Quantity},
     };
@@ -1134,7 +1235,10 @@ mod tests {
             let handler1 = PyCallableHandler::new(py, callable.clone_ref(py)).unwrap();
             let handler2 = PyCallableHandler::new(py, callable).unwrap();
 
-            assert_eq!(handler1.id(), handler2.id());
+            assert_eq!(
+                <PyCallableHandler as Handler<dyn Any>>::id(&handler1),
+                <PyCallableHandler as Handler<dyn Any>>::id(&handler2),
+            );
         });
     }
 
@@ -1305,7 +1409,9 @@ def assert_runtime_errors(component):
 
     for name, args in [("publish_message", ("app.events", 9)),
                        ("subscribe_topic", ("app.events", handler)),
-                       ("unsubscribe_topic", ("app.events", handler))]:
+                       ("unsubscribe_topic", ("app.events", handler)),
+                       ("subscribe_bar_topic", ("data.bars.*", handler)),
+                       ("unsubscribe_bar_topic", ("data.bars.*", handler))]:
         try: getattr(component, name)(*args)
         except RuntimeError: pass
         else: raise AssertionError(name)
@@ -1421,6 +1527,12 @@ for name, args, expected in [
     ("unsubscribe_topic", ("app.events", 67), TypeError),
     ("subscribe_topic", ("app.events", handler, -1), OverflowError),
     ("subscribe_topic", ("app.events", handler, 2**32), OverflowError),
+    ("subscribe_bar_topic", ("", handler), ValueError),
+    ("unsubscribe_bar_topic", ("", handler), ValueError),
+    ("subscribe_bar_topic", ("data.bars.*", 61), TypeError),
+    ("unsubscribe_bar_topic", ("data.bars.*", 67), TypeError),
+    ("subscribe_bar_topic", ("data.bars.*", handler, -1), OverflowError),
+    ("subscribe_bar_topic", ("data.bars.*", handler, 2**32), OverflowError),
 ]:
     try: getattr(actor, name)(*args)
     except expected: pass
@@ -1538,6 +1650,194 @@ actor.dispose()
             .unwrap();
             locals.clear();
             release_actor("MESSAGE-SNAPSHOT");
+        });
+    }
+
+    #[rstest]
+    fn test_py_bar_topic_native_routing_priority_identity_and_ownership() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let first = registered_actor(py, "BAR-FIRST");
+            let second = registered_actor(py, "BAR-SECOND");
+            let locals = PyDict::new(py);
+            let bar = stub_bar();
+            let topic = format!("data.bars.{}", bar.bar_type);
+            locals.set_item("first", &first).unwrap();
+            locals.set_item("second", &second).unwrap();
+            locals.set_item("topic", &topic).unwrap();
+            locals.set_item("bar", bar).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+seen = []
+class Receiver:
+    def receive(self, value): seen.append(("first", value))
+receiver = Receiver()
+def other(value): seen.append(("second", value))
+def custom(value): seen.append(("custom", value))
+first.subscribe_bar_topic(topic, receiver.receive, 100)
+first.subscribe_bar_topic(topic, receiver.receive, 200)
+second.subscribe_bar_topic("data.bars.*", other, 50)
+first.subscribe_topic(topic, custom)
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let observed = Rc::clone(&order);
+            let seen = locals.get_item("seen").unwrap().unwrap().unbind();
+            let native = TypedHandler::from(move |_: &Bar| {
+                Python::attach(|py| observed.borrow_mut().push(seen.bind(py).len().unwrap()));
+            });
+            msgbus_api::subscribe_bars(topic.as_str().into(), native.clone(), Some(75));
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            py.run(
+                c_str!(
+                    r#"
+assert seen == [("first", bar), ("second", bar)]
+seen.clear()
+first.unsubscribe_bar_topic(topic, receiver.receive)
+first.unsubscribe_bar_topic(topic, receiver.receive)
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            py.run(
+                c_str!(
+                    r#"
+assert seen == [("second", bar)]
+seen.clear()
+first.publish_message(topic, bar)
+assert seen == [("custom", bar)]
+first.dispose()
+second.dispose()
+seen.clear()
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            assert_eq!(locals.get_item("seen").unwrap().unwrap().len().unwrap(), 0);
+            assert_eq!(*order.borrow(), vec![1, 0, 0]);
+            msgbus_api::unsubscribe_bars(topic.as_str().into(), &native);
+            locals.clear();
+            release_actor("BAR-FIRST");
+            release_actor("BAR-SECOND");
+        });
+    }
+
+    #[rstest]
+    #[case("reset")]
+    #[case("dispose")]
+    #[case("fault")]
+    fn test_py_bar_topic_lifecycle_releases_callable(#[case] action: &str) {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "BAR-LIFECYCLE");
+            let locals = PyDict::new(py);
+            let bar = stub_bar();
+            let topic = format!("data.bars.{}", bar.bar_type);
+            locals.set_item("actor", &actor).unwrap();
+            locals.set_item("topic", &topic).unwrap();
+            locals.set_item("bar", bar).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import gc
+import weakref
+seen = []
+class Receiver:
+    def receive(self, value): seen.append(value)
+receiver = Receiver()
+ref = weakref.ref(receiver)
+actor.subscribe_bar_topic(topic, receiver.receive)
+del receiver
+assert ref() is not None
+actor.on_fault = lambda: None
+actor.start()
+actor.stop()
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            py.run(
+                c_str!("assert seen == [bar]\nseen.clear()"),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            if action == "fault" {
+                actor.call_method0("resume").unwrap();
+            }
+            actor.call_method0(action).unwrap();
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            py.run(
+                c_str!("gc.collect()\nassert ref() is None\nassert seen == []"),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            if action == "reset" {
+                actor.call_method0("dispose").unwrap();
+            }
+            locals.clear();
+            release_actor("BAR-LIFECYCLE");
+        });
+    }
+
+    #[rstest]
+    fn test_py_bar_topic_reentrant_unsubscribe_and_handler_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "BAR-SNAPSHOT");
+            let locals = PyDict::new(py);
+            let bar = stub_bar();
+            let topic = format!("data.bars.{}", bar.bar_type);
+            locals.set_item("actor", &actor).unwrap();
+            locals.set_item("topic", &topic).unwrap();
+            locals.set_item("bar", bar).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+seen = []
+def low(value): seen.append(("low", value))
+def high(value):
+    actor.unsubscribe_bar_topic(topic, low)
+    seen.append(("high", value))
+    raise ValueError("observer fixture")
+actor.subscribe_bar_topic(topic, high, 100)
+actor.subscribe_bar_topic(topic, low, 50)
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            msgbus_api::publish_bar(topic.as_str().into(), &bar);
+            py.run(
+                c_str!(
+                    "assert seen == [('high', bar), ('low', bar), ('high', bar)]\nactor.dispose()"
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            locals.clear();
+            release_actor("BAR-SNAPSHOT");
         });
     }
 

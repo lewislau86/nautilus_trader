@@ -20,7 +20,7 @@ use nautilus_common::messages::data::{
     RequestFundingRates, RequestJoin, RequestQuotes, RequestTrades, TradesResponse,
 };
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, datetime::NANOSECONDS_IN_SECOND};
-use nautilus_model::identifiers::ClientId;
+use nautilus_model::{data::Bar, identifiers::ClientId};
 use serde_json::Value;
 
 use super::{
@@ -41,6 +41,7 @@ pub(super) struct TimeRangePipelineState {
     response_client_id: ClientId,
     data_count: u64,
     last_response: Option<DataResponse>,
+    historical_bars: Option<Vec<Bar>>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +98,9 @@ impl DataEngine {
         self.time_range_pipeline_requests.insert(
             request_id,
             TimeRangePipelineState {
+                historical_bars: (self.config.validate_historical_bars
+                    && matches!(parent, RequestCommand::Bars(_)))
+                .then(Vec::new),
                 parent,
                 generator,
                 start_ns,
@@ -184,6 +188,7 @@ impl DataEngine {
     }
 
     fn abort_time_range_pipeline(&mut self, parent_id: UUID4) {
+        self.discard_historical_bar_sources(parent_id);
         self.time_range_pipeline_requests.remove(&parent_id);
         self.time_range_pipeline_parent_request_id
             .retain(|_, p_id| *p_id != parent_id);
@@ -199,24 +204,65 @@ impl DataEngine {
             return;
         }
 
-        let data_count = response_params(resp)
-            .and_then(|params| params.get("data_count"))
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| resp.record_count().map(|count| count as u64))
-            .unwrap_or(0);
+        let validate_bars =
+            self.config.validate_historical_bars && matches!(resp, DataResponse::Bars(_));
+        let data_count = if validate_bars {
+            resp.record_count().map_or(0, |count| count as u64)
+        } else {
+            response_params(resp)
+                .and_then(|params| params.get("data_count"))
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| resp.record_count().map(|count| count as u64))
+                .unwrap_or(0)
+        };
+
+        if validate_bars {
+            let DataResponse::Bars(response) = resp else {
+                return;
+            };
+            let Some(source) = self.historical_bar_sources.get(&parent_id) else {
+                return;
+            };
+            let expected_count = source.expected_count;
+            let Some(state) = self.time_range_pipeline_requests.get_mut(&parent_id) else {
+                return;
+            };
+            let Some(bars) = state.historical_bars.as_mut() else {
+                return;
+            };
+
+            if response.data.len() > expected_count.saturating_sub(bars.len()) {
+                self.reject_historical_bar_source(
+                    parent_id,
+                    "Time-range source exceeds original coverage",
+                );
+                return;
+            }
+            bars.extend_from_slice(&response.data);
+        }
 
         if let Some(state) = self.time_range_pipeline_requests.get_mut(&parent_id) {
             state.data_count += data_count;
             state.last_response = Some(resp.clone());
         }
 
-        self.handle_time_range_pipeline_payload(parent_id, resp);
+        if !validate_bars {
+            self.handle_time_range_pipeline_payload(parent_id, resp);
+        }
 
         if let Err(e) =
             self.dispatch_next_time_range_pipeline_request(parent_id, Some(data_count > 0))
         {
             log::error!("Error dispatching time-range pipeline child for {parent_id}: {e}");
-            self.emit_empty_time_range_pipeline_response(parent_id);
+
+            if validate_bars {
+                self.reject_historical_bar_source(
+                    parent_id,
+                    &format!("Time-range child request failed: {e}"),
+                );
+            } else {
+                self.emit_empty_time_range_pipeline_response(parent_id);
+            }
         }
     }
 
@@ -293,7 +339,7 @@ impl DataEngine {
     }
 
     fn emit_empty_time_range_pipeline_response(&mut self, parent_id: UUID4) {
-        let Some(state) = self.time_range_pipeline_requests.remove(&parent_id) else {
+        let Some(mut state) = self.time_range_pipeline_requests.remove(&parent_id) else {
             return;
         };
         self.time_range_pipeline_parent_request_id
@@ -305,6 +351,24 @@ impl DataEngine {
                 "data_count".to_string(),
                 serde_json::json!(state.data_count),
             );
+        }
+
+        if let Some(bars) = state.historical_bars.take() {
+            let RequestCommand::Bars(request) = &state.parent else {
+                return;
+            };
+            let response = DataResponse::Bars(BarsResponse::new(
+                parent_id,
+                state.response_client_id,
+                request.bar_type,
+                bars,
+                Some(state.start_ns),
+                Some(state.end_ns),
+                self.clock.borrow().timestamp_ns(),
+                Some(params),
+            ));
+            self.response(response);
+            return;
         }
 
         let Some(response) = empty_time_range_parent_response(
@@ -545,6 +609,7 @@ fn time_range_child_request(
             request_id,
             ts_init,
             params: time_range_child_params(cmd.params.as_ref()),
+            scope: cmd.scope.clone(),
         }),
         RequestCommand::Join(cmd) => RequestCommand::Join(RequestJoin {
             request_ids: cmd.request_ids.clone(),
@@ -834,6 +899,7 @@ mod tests {
             response_client_id: ClientId::new("TEST"),
             data_count: 0,
             last_response: None,
+            historical_bars: None,
         };
 
         let result =

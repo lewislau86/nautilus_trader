@@ -37,11 +37,15 @@ use nautilus_common::{
     clock::Clock,
     component::{Component, with_component_registry},
     enums::ComponentState,
-    messages::system::{QueueStateChanged, SocketStateChanged},
+    messages::{
+        data::{BarsResponse, HistoricalBarsRequestFailure},
+        system::{QueueStateChanged, SocketStateChanged},
+    },
     python::{
         cache::PyCache,
         clock::PyClock,
         config_error_to_pyvalue_err,
+        history::{PyHistoricalBarsRequestFailure, PyHistoricalBarsResponse},
         indicators::{registered_python_indicators, wrap_python_indicator},
         logging::PyLogger,
         order_factory::PyOrderFactory,
@@ -877,6 +881,29 @@ impl PyStrategyInner {
         Ok(())
     }
 
+    fn dispatch_on_historical_bars_response(&mut self, response: BarsResponse) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                let py_response = Py::new(py, PyHistoricalBarsResponse::from(response))?;
+                py_self.call_method1(py, "on_historical_bars_response", (py_response,))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_on_historical_bars_request_failed(
+        &mut self,
+        failure: HistoricalBarsRequestFailure,
+    ) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                let py_failure = Py::new(py, PyHistoricalBarsRequestFailure::from(failure))?;
+                py_self.call_method1(py, "on_historical_bars_request_failed", (py_failure,))
+            })?;
+        }
+        Ok(())
+    }
+
     fn dispatch_on_historical_mark_prices(
         &mut self,
         mark_prices: Vec<MarkPriceUpdate>,
@@ -1251,6 +1278,22 @@ impl DataActor for PyStrategyInner {
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         self.dispatch_on_historical_bars(bars.to_vec())
             .map_err(|e| anyhow::anyhow!("Python on_historical_bars failed: {e}"))
+    }
+
+    fn on_historical_bars_request_failed(
+        &mut self,
+        failure: &HistoricalBarsRequestFailure,
+    ) -> anyhow::Result<()> {
+        self.dispatch_on_historical_bars_request_failed(failure.clone())
+            .map_err(|e| anyhow::anyhow!("Python on_historical_bars_request_failed failed: {e}"))
+    }
+
+    fn on_historical_bars_response(&mut self, response: &BarsResponse) -> anyhow::Result<()> {
+        if response.historical_outcome.is_none() {
+            return self.on_historical_bars(&response.data);
+        }
+        self.dispatch_on_historical_bars_response(response.clone())
+            .map_err(|e| anyhow::anyhow!("Python on_historical_bars_response failed: {e}"))
     }
 
     fn on_historical_mark_prices(&mut self, mark_prices: &[MarkPriceUpdate]) -> anyhow::Result<()> {
@@ -1809,8 +1852,11 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "reset")]
-    fn py_reset(&mut self) -> PyResult<()> {
-        Component::reset(self.inner_mut()).map_err(to_pyruntime_err)
+    fn py_reset(slf: PyRef<'_, Self>) -> PyResult<()> {
+        // Release the Python borrow before the reset hook accesses its Native facade
+        let strategy = slf.clone();
+        drop(slf);
+        Component::reset(strategy.inner_mut()).map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "dispose")]
@@ -2415,6 +2461,25 @@ impl PyStrategy {
     #[pyo3(name = "on_historical_bars")]
     fn py_on_historical_bars(&mut self, bars: Vec<Bar>) {
         // Default implementation - can be overridden in Python subclasses
+    }
+
+    #[pyo3(name = "on_historical_bars_response")]
+    fn py_on_historical_bars_response(
+        slf: &Bound<'_, Self>,
+        response: &Bound<'_, PyHistoricalBarsResponse>,
+    ) -> PyResult<()> {
+        let bars = response.borrow().bars();
+        slf.call_method1("on_historical_bars", (bars,))?;
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_historical_bars_request_failed")]
+    fn py_on_historical_bars_request_failed(
+        &self,
+        failure: &Bound<'_, PyHistoricalBarsRequestFailure>,
+    ) {
+        // No legacy empty-bar notification: this is explicit failed request metadata
     }
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -3531,6 +3596,46 @@ impl PyStrategy {
     ) -> PyResult<()> {
         let messages = get_python_message_bus(slf.as_any())?;
         messages.unsubscribe_topic(topic, handler)
+    }
+
+    /// Observes native Bar publications matching a topic pattern.
+    ///
+    /// Uses the typed Bar router, without sending data commands or creating venue subscriptions.
+    /// Higher priorities run first. Identity, ownership and lifecycle match `subscribe_topic`;
+    /// duplicate subscriptions are a no-op. Handler errors are logged and do not veto delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    #[pyo3(name = "subscribe_bar_topic", signature = (topic, handler, priority=0))]
+    fn py_subscribe_bar_topic(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[nautilus_trader.model.Bar], None]", imports = ("collections.abc", "nautilus_trader.model",)))]
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.subscribe_bar_topic(slf.py(), topic, handler, priority)
+    }
+
+    /// Removes this component's exact native Bar pattern and callable subscription.
+    ///
+    /// An absent subscription is a no-op. A callback already selected for synchronous publication
+    /// may still run. This sends no data command and does not affect venue subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    #[pyo3(name = "unsubscribe_bar_topic", signature = (topic, handler))]
+    fn py_unsubscribe_bar_topic(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[nautilus_trader.model.Bar], None]", imports = ("collections.abc", "nautilus_trader.model",)))]
+        handler: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.unsubscribe_bar_topic(topic, handler)
     }
 }
 
@@ -4786,6 +4891,386 @@ class SelfFaultingStrategy(Strategy):
         });
     }
 
+    #[rstest::rstest]
+    #[case(false, false, false)]
+    #[case(true, false, false)]
+    #[case(true, false, true)]
+    #[case(true, true, false)]
+    #[case(true, true, true)]
+    fn test_python_history_strategy_native_receiver_indicator_order_and_legacy_hook(
+        #[case] typed: bool,
+        #[case] failed: bool,
+        #[case] legacy: bool,
+    ) {
+        use nautilus_common::messages::data::{HistoricalBarsBatch, HistoricalBarsOutcome};
+        use pyo3::types::{PyListMethods, PyModule, PyModuleMethods};
+
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "strategy_history_receiver").unwrap();
+            module.add_class::<PyStrategy>().unwrap();
+            py.run(
+                c_str!(
+                    r#"
+class LegacyHistoryReceiver(Strategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = []
+        self.events = []
+    def on_historical_bars(self, bars: list[object]) -> None:
+        self.events.append('raw')
+        self.calls.append(('raw', bars))
+class HistoryReceiver(LegacyHistoryReceiver):
+    def on_historical_bars_response(self, response: object) -> None:
+        self.events.append('typed')
+        self.calls.append(('typed', response))
+"#
+                ),
+                Some(&module.dict()),
+                Some(&module.dict()),
+            )
+            .unwrap();
+            let receiver = module
+                .getattr(if legacy {
+                    "LegacyHistoryReceiver"
+                } else {
+                    "HistoryReceiver"
+                })
+                .unwrap()
+                .call0()
+                .unwrap();
+            let wrapper = receiver.extract::<Py<PyStrategy>>().unwrap();
+            let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+            let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+            let portfolio = Rc::new(RefCell::new(Portfolio::new(
+                clock.clone(),
+                cache.clone(),
+                None,
+            )));
+            wrapper
+                .borrow_mut(py)
+                .register(TraderId::from("TRADER-001"), clock, cache, portfolio)
+                .unwrap();
+            let source = sample_bar();
+            let target_type = BarType::from("AUD/USD.SIM-5-MINUTE-LAST-INTERNAL");
+            let mut target = source;
+            target.bar_type = target_type;
+            let events = receiver
+                .getattr("events")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap();
+            let source_indicator = create_event_tracking_python_indicator(py, &events).unwrap();
+            let target_indicator = create_event_tracking_python_indicator(py, &events).unwrap();
+            wrapper.borrow_mut(py).py_register_indicator_for_bars(
+                py,
+                source.bar_type,
+                source_indicator.clone_ref(py),
+            );
+            wrapper.borrow_mut(py).py_register_indicator_for_bars(
+                py,
+                target_type,
+                target_indicator.clone_ref(py),
+            );
+            let request_id = UUID4::new();
+            let mut response = BarsResponse::new(
+                request_id,
+                ClientId::from("SIM"),
+                source.bar_type,
+                if failed { Vec::new() } else { vec![source] },
+                Some(UnixNanos::from(71)),
+                Some(UnixNanos::from(91)),
+                UnixNanos::from(111),
+                None,
+            );
+
+            if typed {
+                response.historical_outcome = Some(if failed {
+                    HistoricalBarsOutcome::Failed {
+                        error: "original source failed".to_string(),
+                        aggregate_bar_types: vec![target_type],
+                    }
+                } else {
+                    HistoricalBarsOutcome::Validated {
+                        aggregates: vec![HistoricalBarsBatch {
+                            bar_type: target_type,
+                            data: vec![target],
+                        }],
+                    }
+                });
+            }
+            let runtime_strategy = PyStrategy {
+                inner: Rc::clone(&wrapper.borrow(py).inner),
+            };
+            runtime_strategy.inner_mut().handle_bars_response(&response);
+            let calls = receiver
+                .getattr("calls")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap();
+            let hook = if typed && !legacy { "typed" } else { "raw" };
+            let mut expected_events = Vec::new();
+            if !failed {
+                expected_events.push("indicator:bar".to_string());
+                if typed {
+                    expected_events.push("indicator:bar".to_string());
+                }
+            }
+            expected_events.push(hook.to_string());
+
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls
+                    .get_item(0)
+                    .unwrap()
+                    .get_item(0)
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                hook
+            );
+            assert_eq!(events.extract::<Vec<String>>().unwrap(), expected_events);
+            assert_eq!(
+                python_indicator_call_count(&source_indicator, py, "bar"),
+                i32::from(!failed)
+            );
+            assert_eq!(
+                python_indicator_call_count(&target_indicator, py, "bar"),
+                i32::from(typed && !failed)
+            );
+            let delivered = calls.get_item(0).unwrap().get_item(1).unwrap();
+
+            if hook == "typed" {
+                assert_eq!(
+                    delivered
+                        .getattr("correlation_id")
+                        .unwrap()
+                        .extract::<UUID4>()
+                        .unwrap(),
+                    request_id
+                );
+                assert_eq!(
+                    delivered
+                        .call_method0("bars")
+                        .unwrap()
+                        .extract::<Vec<Bar>>()
+                        .unwrap(),
+                    response.data
+                );
+                let outcome = delivered.getattr("historical_outcome").unwrap();
+                assert_eq!(
+                    outcome
+                        .getattr("is_validated")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    !failed
+                );
+                assert_eq!(
+                    outcome
+                        .call_method0("aggregate_bar_types")
+                        .unwrap()
+                        .extract::<Vec<BarType>>()
+                        .unwrap(),
+                    vec![target_type]
+                );
+                let batches = outcome.call_method0("aggregates").unwrap();
+                assert_eq!(
+                    batches.cast::<PyList>().unwrap().len(),
+                    usize::from(!failed)
+                );
+
+                if !failed {
+                    let batch = batches.get_item(0).unwrap();
+                    assert_eq!(
+                        batch
+                            .getattr("bar_type")
+                            .unwrap()
+                            .extract::<BarType>()
+                            .unwrap(),
+                        target_type
+                    );
+                    assert_eq!(
+                        batch
+                            .call_method0("bars")
+                            .unwrap()
+                            .extract::<Vec<Bar>>()
+                            .unwrap(),
+                        vec![target]
+                    );
+                }
+            } else {
+                assert_eq!(delivered.extract::<Vec<Bar>>().unwrap(), response.data);
+            }
+        });
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_python_history_strategy_admission_failure_native_receiver(#[case] override_hook: bool) {
+        use nautilus_common::messages::data::{HistoricalBarsRequestFailure, RequestBars};
+        use pyo3::types::{PyListMethods, PyModule, PyModuleMethods};
+
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "strategy_admission_receiver").unwrap();
+            module.add_class::<PyStrategy>().unwrap();
+            py.run(
+                c_str!(
+                    r#"
+class LegacyReceiver(Strategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.raw = []
+        self.failures = []
+    def on_historical_bars(self, bars: list[object]) -> None:
+        self.raw.append(bars)
+class FailureReceiver(LegacyReceiver):
+    def on_historical_bars_request_failed(self, failure: object) -> None:
+        self.failures.append(failure)
+"#
+                ),
+                Some(&module.dict()),
+                Some(&module.dict()),
+            )
+            .unwrap();
+            let receiver = module
+                .getattr(if override_hook {
+                    "FailureReceiver"
+                } else {
+                    "LegacyReceiver"
+                })
+                .unwrap()
+                .call0()
+                .unwrap();
+            let wrapper = receiver.extract::<Py<PyStrategy>>().unwrap();
+            let failure = HistoricalBarsRequestFailure {
+                request: RequestBars::new(
+                    sample_bar().bar_type,
+                    None,
+                    None,
+                    None,
+                    Some(ClientId::from("UNRESOLVED-HINT")),
+                    UUID4::new(),
+                    UnixNanos::from(71),
+                    None,
+                ),
+                client_id: None,
+                error: "missing source".to_string(),
+                aggregate_bar_types: vec![BarType::from("AUD/USD.SIM-5-MINUTE-LAST-INTERNAL")],
+                ts_init: UnixNanos::from(91),
+            };
+            let runtime_strategy = PyStrategy {
+                inner: Rc::clone(&wrapper.borrow(py).inner),
+            };
+            runtime_strategy
+                .inner_mut()
+                .handle_historical_bars_request_failed(&failure);
+            let failures = receiver
+                .getattr("failures")
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap();
+            assert_eq!(failures.len(), usize::from(override_hook));
+            assert!(
+                receiver
+                    .getattr("raw")
+                    .unwrap()
+                    .cast_into::<PyList>()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            if override_hook {
+                let delivered = failures.get_item(0).unwrap();
+                assert_eq!(
+                    delivered
+                        .getattr("correlation_id")
+                        .unwrap()
+                        .extract::<UUID4>()
+                        .unwrap(),
+                    failure.request.request_id
+                );
+                assert!(delivered.getattr("client_id").unwrap().is_none());
+                assert_eq!(
+                    delivered
+                        .getattr("requested_client_id")
+                        .unwrap()
+                        .extract::<ClientId>()
+                        .unwrap(),
+                    failure.request.client_id.unwrap()
+                );
+                assert_eq!(
+                    delivered
+                        .getattr("error")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    failure.error
+                );
+                assert_eq!(
+                    delivered
+                        .call_method0("aggregate_bar_types")
+                        .unwrap()
+                        .extract::<Vec<BarType>>()
+                        .unwrap(),
+                    failure.aggregate_bar_types
+                );
+            }
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_python_history_strategy_callback_exception_is_reported() {
+        use nautilus_common::messages::data::HistoricalBarsOutcome;
+        use pyo3::types::{PyModule, PyModuleMethods};
+
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "strategy_history_exception").unwrap();
+            module.add_class::<PyStrategy>().unwrap();
+            py.run(
+                c_str!(
+                    r#"
+class HistoryReceiver(Strategy):
+    def on_historical_bars_response(self, response: object) -> None:
+        raise RuntimeError('history receiver failed')
+"#
+                ),
+                Some(&module.dict()),
+                Some(&module.dict()),
+            )
+            .unwrap();
+            let receiver = module.getattr("HistoryReceiver").unwrap().call0().unwrap();
+            let wrapper = receiver.extract::<Py<PyStrategy>>().unwrap();
+            let mut response = BarsResponse::new(
+                UUID4::new(),
+                ClientId::from("SIM"),
+                sample_bar().bar_type,
+                Vec::new(),
+                None,
+                None,
+                UnixNanos::from(1),
+                None,
+            );
+            response.historical_outcome = Some(HistoricalBarsOutcome::Failed {
+                error: "source failed".to_string(),
+                aggregate_bar_types: Vec::new(),
+            });
+            let runtime_strategy = PyStrategy {
+                inner: Rc::clone(&wrapper.borrow(py).inner),
+            };
+            let result = runtime_strategy
+                .inner_mut()
+                .on_historical_bars_response(&response);
+
+            assert!(result.unwrap_err().to_string().contains(
+                "Python on_historical_bars_response failed: RuntimeError: history receiver failed"
+            ));
+        });
+    }
+
     fn assert_python_dispatch<F>(py: Python<'_>, method_name: &str, invoke: F) -> Py<PyAny>
     where
         F: FnOnce(&mut PyStrategy) -> anyhow::Result<()>,
@@ -4798,6 +5283,80 @@ class SelfFaultingStrategy(Strategy):
         assert_eq!(python_method_call_count(&py_strategy, py, method_name), 1);
 
         py_strategy
+    }
+
+    #[rstest::rstest]
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_public_python_reset_releases_receiver_before_author_hook(
+        #[case] stopped: bool,
+        #[case] hook_error: bool,
+    ) {
+        use pyo3::types::{PyModule, PyModuleMethods};
+
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "public_reset_probe").unwrap();
+            module.add("Strategy", py.get_type::<PyStrategy>()).unwrap();
+            module.add("hook_error", hook_error).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+class NativeResetProbe(Strategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset_observations = []
+    def on_reset(self) -> None:
+        self.reset_observations.append((str(self.strategy_id), self.clock.timestamp_ns()))
+        if hook_error:
+            raise RuntimeError('author reset failed')
+"#
+                ),
+                Some(&module.dict()),
+                Some(&module.dict()),
+            )
+            .unwrap();
+            let receiver = module.getattr("NativeResetProbe").unwrap().call0().unwrap();
+            let wrapper = receiver.extract::<Py<PyStrategy>>().unwrap();
+            let mut strategy = wrapper.borrow(py).clone();
+            let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+            let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+            let portfolio = Rc::new(RefCell::new(Portfolio::new(
+                clock.clone(),
+                cache.clone(),
+                None,
+            )));
+            strategy
+                .register(TraderId::from("TRADER-RESET-041"), clock, cache, portfolio)
+                .unwrap();
+            if stopped {
+                Component::start(strategy.inner_mut()).unwrap();
+                Component::stop(strategy.inner_mut()).unwrap();
+            }
+
+            let result = receiver.call_method0("reset");
+            let observations = receiver
+                .getattr("reset_observations")
+                .unwrap()
+                .extract::<Vec<(String, u64)>>()
+                .unwrap();
+
+            assert_eq!(observations, vec![("NativeResetProbe-None".to_string(), 0)]);
+
+            if hook_error {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Python on_reset failed: RuntimeError: author reset failed")
+                );
+            } else {
+                result.unwrap();
+                assert!(Component::is_ready(strategy.inner()));
+            }
+        });
     }
 
     #[rstest::rstest]

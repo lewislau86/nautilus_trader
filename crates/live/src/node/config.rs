@@ -106,6 +106,12 @@ pub struct LiveDataEngineConfig {
     /// If data timestamp sequencing should be validated and handled.
     #[builder(default)]
     pub validate_data_sequence: bool,
+    /// Validates original, complete closed 1m historical sources before Native cache or aggregation.
+    ///
+    /// Explicit opt-in requires standard 1-MINUTE-LAST-EXTERNAL sources and bounded UTC requests;
+    /// the default retains Native partial-history semantics.
+    #[builder(default)]
+    pub validate_historical_bars: bool,
     /// If order book deltas should be buffered until the `F_LAST` flag is set for a delta.
     #[builder(default)]
     pub buffer_deltas: bool,
@@ -156,6 +162,7 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
             time_bars_build_delay: config.time_bars_build_delay,
             time_bars_origin_offset,
             validate_data_sequence: config.validate_data_sequence,
+            validate_historical_bars: config.validate_historical_bars,
             buffer_deltas: config.buffer_deltas,
             emit_quotes_from_book: config.emit_quotes_from_book,
             emit_quotes_from_book_depths: config.emit_quotes_from_book_depths,
@@ -1419,6 +1426,26 @@ mean_dispatch_ns_clear = 700
             Some(vec![ClientId::from("EXTERNAL")]),
         );
         assert!(converted.debug);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_live_data_engine_config_retains_explicit_historical_source_validation(
+        #[case] validate: bool,
+    ) {
+        assert!(!LiveDataEngineConfig::default().validate_historical_bars);
+        let config = LiveDataEngineConfig::builder()
+            .validate_historical_bars(validate)
+            .build();
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            encoded["validate_historical_bars"],
+            serde_json::json!(validate)
+        );
+        let decoded: LiveDataEngineConfig = serde_json::from_value(encoded).unwrap();
+        let converted: DataEngineConfig = decoded.into();
+        assert_eq!(converted.validate_historical_bars, validate);
     }
 
     #[rstest]

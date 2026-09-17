@@ -70,6 +70,8 @@ impl DataEngineConfig {
         external_clients = None,
         debug = None,
         disable_historical_cache = None,
+        *,
+        validate_historical_bars = None,
     ))]
     fn py_new(
         time_bars_build_with_no_updates: Option<bool>,
@@ -85,6 +87,7 @@ impl DataEngineConfig {
         external_clients: Option<Vec<ClientId>>,
         debug: Option<bool>,
         disable_historical_cache: Option<bool>,
+        validate_historical_bars: Option<bool>,
     ) -> PyResult<Self> {
         let time_bars_interval_type = match time_bars_interval_type {
             Some(value) => Some(coerce_bar_interval_type(&value)?),
@@ -103,6 +106,7 @@ impl DataEngineConfig {
             .maybe_time_bars_build_delay(time_bars_build_delay)
             .maybe_time_bars_origin_offset(time_bars_origin_offset)
             .maybe_validate_data_sequence(validate_data_sequence)
+            .maybe_validate_historical_bars(validate_historical_bars)
             .maybe_buffer_deltas(buffer_deltas)
             .maybe_emit_quotes_from_book(emit_quotes_from_book)
             .maybe_emit_quotes_from_book_depths(emit_quotes_from_book_depths)
@@ -158,6 +162,12 @@ impl DataEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "validate_historical_bars")]
+    const fn py_validate_historical_bars(&self) -> bool {
+        self.validate_historical_bars
+    }
+
+    #[getter]
     #[pyo3(name = "buffer_deltas")]
     const fn py_buffer_deltas(&self) -> bool {
         self.buffer_deltas
@@ -199,5 +209,114 @@ impl DataEngineConfig {
 
     fn __str__(&self) -> String {
         format!("{self:?}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::{
+        IntoPyObjectExt, Python,
+        exceptions::PyTypeError,
+        prelude::*,
+        types::{PyDict, PyTuple},
+    };
+    use rstest::rstest;
+
+    use super::DataEngineConfig;
+
+    #[rstest]
+    fn test_python_history_validation_config_preserves_legacy_positional_signature() {
+        Python::initialize();
+        Python::attach(|py| {
+            let constructor = py.get_type::<DataEngineConfig>();
+            let positional = PyTuple::new(
+                py,
+                (0..13).map(|index| {
+                    if index == 12 {
+                        true.into_py_any(py).unwrap()
+                    } else {
+                        py.None()
+                    }
+                }),
+            )
+            .unwrap();
+            let config = constructor.call(positional, None).unwrap();
+            let too_many = PyTuple::new(py, (0..14).map(|_| py.None())).unwrap();
+            let positional_error = constructor.call(too_many, None).unwrap_err();
+
+            assert!(
+                config
+                    .getattr("disable_historical_cache")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(
+                !config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap()
+            );
+            assert!(positional_error.is_instance_of::<PyTypeError>(py));
+        });
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(false))]
+    #[case(Some(true))]
+    fn test_python_history_validation_config_explicit_flag(#[case] enabled: Option<bool>) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if let Some(enabled) = enabled {
+                kwargs
+                    .set_item("validate_historical_bars", enabled)
+                    .unwrap();
+            }
+            let config = py
+                .get_type::<DataEngineConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            let expected = enabled.unwrap_or(false);
+            assert_eq!(
+                config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                config
+                    .extract::<DataEngineConfig>()
+                    .unwrap()
+                    .validate_historical_bars,
+                expected,
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_python_history_validation_config_explicit_none_uses_default() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("validate_historical_bars", py.None())
+                .unwrap();
+            let config = py
+                .get_type::<DataEngineConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            assert!(
+                !config
+                    .getattr("validate_historical_bars")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+            );
+        });
     }
 }

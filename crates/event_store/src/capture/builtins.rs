@@ -39,8 +39,9 @@ use nautilus_common::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
+            DataCommand, DataResponse, FundingRatesResponse, HistoricalBarsRequestFailure,
+            InstrumentResponse, InstrumentsResponse, OptionChainReferencePriceResponse,
+            QuotesResponse, TradesResponse,
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
@@ -190,6 +191,8 @@ pub const PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE: &str =
     "OptionChainReferencePriceResponse";
 /// The canonical `payload_type` tag for [`BarsResponse`].
 pub const PAYLOAD_TYPE_BARS_RESPONSE: &str = "BarsResponse";
+/// The canonical `payload_type` tag for [`HistoricalBarsRequestFailure`].
+pub const PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE: &str = "HistoricalBarsRequestFailure";
 
 // Wrapper-level fallback tag reached only when a dispatcher returns an
 // `EncodedPayload` without an override. Every current variant stamps its own
@@ -266,6 +269,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
     PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
     PAYLOAD_TYPE_BARS_RESPONSE,
+    PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE,
 ];
 
 /// Returns an [`EncoderRegistry`] preloaded with the default encoders.
@@ -1341,6 +1345,7 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
             encode_option_chain_reference_price_response(resp)
         }
         DataResponse::Bars(resp) => encode_bars_response(resp),
+        DataResponse::BarsRequestFailed(resp) => encode_historical_bars_request_failure(resp),
     }
 }
 
@@ -1498,6 +1503,17 @@ fn encode_bars_response(response: &BarsResponse) -> Result<EncodedPayload, Encod
     let payload = encode_serde(response)?;
     Ok(EncodedPayload::with_payload_type(
         payload_type(PAYLOAD_TYPE_BARS_RESPONSE),
+        payload,
+        Vec::new(),
+    ))
+}
+
+fn encode_historical_bars_request_failure(
+    failure: &HistoricalBarsRequestFailure,
+) -> Result<EncodedPayload, EncodeError> {
+    let payload = encode_serde(failure)?;
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE),
         payload,
         Vec::new(),
     ))
@@ -3683,6 +3699,102 @@ mod tests {
         let decoded: BarsResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.correlation_id, response.correlation_id);
         assert_eq!(decoded.bar_type, response.bar_type);
+        assert!(decoded.historical_outcome.is_none());
+    }
+
+    fn make_historical_admission_failure() -> HistoricalBarsRequestFailure {
+        use nautilus_common::messages::data::{RequestBars, RequestScope};
+
+        let response = make_bars_response();
+        let mut request = RequestBars::new(
+            response.bar_type,
+            Some("1969-12-31T23:59:59.999999999Z".parse().unwrap()),
+            None,
+            std::num::NonZeroUsize::new(7),
+            Some(ClientId::from("UNRESOLVED-HINT")),
+            response.correlation_id,
+            UnixNanos::from(71),
+            response.params,
+        );
+        request.scope = Some(RequestScope::default());
+        HistoricalBarsRequestFailure {
+            request,
+            client_id: None,
+            error: "original source unavailable".to_string(),
+            aggregate_bar_types: vec![BarType::from("BTCUSDT.BINANCE-5-MINUTE-LAST-INTERNAL")],
+            ts_init: UnixNanos::from(91),
+        }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn data_response_historical_admission_failure_round_trips_original_context(
+        #[case] resolved: bool,
+    ) {
+        let mut failure = make_historical_admission_failure();
+        failure.client_id = resolved.then(|| ClientId::from("RESOLVED-SOURCE"));
+        let envelope = DataResponse::BarsRequestFailed(Box::new(failure.clone()));
+        assert_eq!(*envelope.correlation_id(), failure.request.request_id);
+        assert_eq!(envelope.record_count(), None);
+        assert_eq!(
+            extract_data_response_headers(&envelope).correlation_id,
+            Some(failure.request.request_id)
+        );
+        let encoded = encode_data_response(&envelope).unwrap();
+        assert_eq!(
+            encoded.payload_type.unwrap().as_str(),
+            PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE
+        );
+        assert!(encoded.index_keys.is_empty());
+        let decoded: HistoricalBarsRequestFailure =
+            rmp_serde::from_slice(&encoded.payload).unwrap();
+        assert_eq!(decoded.request.request_id, failure.request.request_id);
+        assert_eq!(decoded.request.client_id, failure.request.client_id);
+        assert_eq!(decoded.request.bar_type, failure.request.bar_type);
+        assert_eq!(decoded.request.start, failure.request.start);
+        assert_eq!(decoded.request.end, failure.request.end);
+        assert_eq!(decoded.request.limit, failure.request.limit);
+        assert_eq!(decoded.request.ts_init, failure.request.ts_init);
+        assert_eq!(decoded.request.params, failure.request.params);
+        assert!(decoded.request.scope.is_none());
+        assert_eq!(decoded.client_id, failure.client_id);
+        assert_eq!(decoded.error, failure.error);
+        assert_eq!(decoded.aggregate_bar_types, failure.aggregate_bar_types);
+        assert_eq!(decoded.ts_init, failure.ts_init);
+        let fields: std::collections::HashMap<String, Option<serde::de::IgnoredAny>> =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&failure.request).unwrap()).unwrap();
+        assert!(!fields.contains_key("scope"));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn data_response_bars_historical_outcome_payload_round_trips(#[case] failed: bool) {
+        use nautilus_common::messages::data::{HistoricalBarsBatch, HistoricalBarsOutcome};
+
+        let mut response = make_bars_response();
+        let target = BarType::from("BTCUSDT.BINANCE-5-MINUTE-LAST-INTERNAL");
+        response.historical_outcome = Some(if failed {
+            HistoricalBarsOutcome::Failed {
+                error: "Original source has a gap".to_string(),
+                aggregate_bar_types: vec![target],
+            }
+        } else {
+            HistoricalBarsOutcome::Validated {
+                aggregates: vec![HistoricalBarsBatch {
+                    bar_type: target,
+                    data: Vec::new(),
+                }],
+            }
+        });
+        let encoded = encode_data_response(&DataResponse::Bars(response.clone())).expect("encode");
+        let decoded: BarsResponse = rmp_serde::from_slice(&encoded.payload).expect("decode");
+        assert_eq!(decoded.correlation_id, response.correlation_id);
+        assert_eq!(decoded.client_id, response.client_id);
+        assert_eq!(decoded.bar_type, response.bar_type);
+        assert_eq!(decoded.historical_outcome, response.historical_outcome);
+        assert!(decoded.data.is_empty());
     }
 
     #[rstest]
@@ -3744,6 +3856,10 @@ mod tests {
         PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE
     )]
     #[case::bars(DataResponse::Bars(make_bars_response()), PAYLOAD_TYPE_BARS_RESPONSE)]
+    #[case::historical_admission(
+        DataResponse::BarsRequestFailed(Box::new(make_historical_admission_failure())),
+        PAYLOAD_TYPE_HISTORICAL_BARS_REQUEST_FAILURE
+    )]
     fn data_response_envelope_stamps_inner_tag_for_every_variant(
         #[case] response: DataResponse,
         #[case] expected_tag: &str,

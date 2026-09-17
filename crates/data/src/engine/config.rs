@@ -57,6 +57,12 @@ pub struct DataEngineConfig {
     /// If data objects timestamp sequencing will be validated and handled.
     #[builder(default)]
     pub validate_data_sequence: bool,
+    /// If closed 1m LAST EXTERNAL history is validated against original request source and coverage.
+    ///
+    /// Requires explicit start, end and a sufficient limit. The default retains partial-history
+    /// semantics. Validation precedes bar cache and aggregation updates, including pipeline fan-in.
+    #[builder(default)]
+    pub validate_historical_bars: bool,
     /// If order book deltas should be buffered until the `F_LAST` flag is set for a delta.
     #[builder(default)]
     pub buffer_deltas: bool,

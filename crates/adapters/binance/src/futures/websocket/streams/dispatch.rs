@@ -385,9 +385,7 @@ pub(crate) fn dispatch_order_update(
                     return;
                 }
 
-                if !dispatch_state.mark_accepted_once(client_order_id) {
-                    log::debug!("Skipping duplicate Accepted for {client_order_id}");
-                } else {
+                if dispatch_state.mark_accepted_once(client_order_id) {
                     let accepted = OrderAccepted::new(
                         emitter.trader_id(),
                         identity.strategy_id,
@@ -401,6 +399,8 @@ pub(crate) fn dispatch_order_update(
                         false,
                     );
                     emitter.send_order_event(OrderEventAny::Accepted(accepted));
+                } else {
+                    log::debug!("Skipping duplicate Accepted for {client_order_id}");
                 }
 
                 emit_order_delta_if_changed(
