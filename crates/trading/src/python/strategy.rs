@@ -1366,6 +1366,15 @@ impl PyStrategy {
         // callers never hold a mutable and shared reference simultaneously.
         unsafe { &mut *self.inner.get() }
     }
+
+    fn stop_inner(&self) -> PyResult<()> {
+        let inner = self.inner_mut();
+        if Strategy::stop(inner) {
+            Component::stop(inner).map_err(to_pyruntime_err)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl PyStrategy {
@@ -1777,13 +1786,15 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "stop")]
-    fn py_stop(&mut self) -> PyResult<()> {
-        let inner = self.inner_mut();
-        if Strategy::stop(inner) {
-            Component::stop(inner).map_err(to_pyruntime_err)
-        } else {
-            Ok(())
-        }
+    fn py_stop(slf: PyRef<'_, Self>) -> PyResult<()> {
+        // Release the PyO3 receiver before the lifecycle hook runs.  `on_stop` is
+        // user Python and may inspect the strategy's Native facade (clock, cache,
+        // or strategy id), just like `on_reset`; keeping the mutable `PyCell`
+        // borrow alive would make that legitimate access fail with a re-entrant
+        // borrow error.
+        let strategy = slf.clone();
+        drop(slf);
+        strategy.stop_inner()
     }
 
     #[pyo3(name = "market_exit")]
@@ -5360,6 +5371,71 @@ class NativeResetProbe(Strategy):
     }
 
     #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_public_python_stop_releases_receiver_before_author_hook(#[case] hook_error: bool) {
+        use pyo3::types::{PyModule, PyModuleMethods};
+
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "public_stop_probe").unwrap();
+            module.add("Strategy", py.get_type::<PyStrategy>()).unwrap();
+            module.add("hook_error", hook_error).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+class NativeStopProbe(Strategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_observations = []
+    def on_stop(self) -> None:
+        self.stop_observations.append((str(self.strategy_id), self.clock.timestamp_ns()))
+        if hook_error:
+            raise RuntimeError('author stop failed')
+"#
+                ),
+                Some(&module.dict()),
+                Some(&module.dict()),
+            )
+            .unwrap();
+            let receiver = module.getattr("NativeStopProbe").unwrap().call0().unwrap();
+            let wrapper = receiver.extract::<Py<PyStrategy>>().unwrap();
+            let mut strategy = wrapper.borrow(py).clone();
+            let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+            let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+            let portfolio = Rc::new(RefCell::new(Portfolio::new(
+                clock.clone(),
+                cache.clone(),
+                None,
+            )));
+            strategy
+                .register(TraderId::from("TRADER-STOP-041"), clock, cache, portfolio)
+                .unwrap();
+            Component::start(strategy.inner_mut()).unwrap();
+
+            let result = receiver.call_method0("stop");
+            let observations = receiver
+                .getattr("stop_observations")
+                .unwrap()
+                .extract::<Vec<(String, u64)>>()
+                .unwrap();
+
+            assert_eq!(observations, vec![("NativeStopProbe-None".to_string(), 0)]);
+            if hook_error {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Python on_stop failed: RuntimeError: author stop failed")
+                );
+            } else {
+                result.unwrap();
+                assert!(Component::is_stopped(strategy.inner()));
+            }
+        });
+    }
+
+    #[rstest::rstest]
     #[case("on_start")]
     #[case("on_stop")]
     #[case("on_resume")]
@@ -5694,7 +5770,7 @@ class NativeResetProbe(Strategy):
                 create_registered_tracking_strategy_with_config(py, Some(config));
 
             rust_strategy.py_start().unwrap();
-            rust_strategy.py_stop().unwrap();
+            rust_strategy.stop_inner().unwrap();
 
             assert!(rust_strategy.py_is_stopped());
             assert!(!rust_strategy.inner().core.pending_stop);
@@ -5717,7 +5793,7 @@ class NativeResetProbe(Strategy):
                 create_registered_tracking_strategy_with_config(py, Some(config));
 
             rust_strategy.py_start().unwrap();
-            rust_strategy.py_stop().unwrap();
+            rust_strategy.stop_inner().unwrap();
 
             assert!(rust_strategy.py_is_running());
             assert!(rust_strategy.inner().core.pending_stop);
